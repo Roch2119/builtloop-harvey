@@ -1921,6 +1921,22 @@ function qCard(c) {
         qBadge(QDEC[d.decision] || d.decision || 'n/a', d.decision === 'pass' ? 'good' : d.decision === 'fail' ? 'bad' : 'warn') +
         '<div class="q-reason">' + escHtml(d.reason || '') + '</div></div>';
     }).join('') + '</div>';
+  const rt = c.routes || {};
+  const rtLines = [];
+  (rt.emails || []).forEach(e => rtLines.push('Email: ' + escHtml(e.address) + ' <span class="muted">(' +
+    escHtml(e.source) + (e.on_domain ? ', their own domain' : e.freemail ? ', free-mail address' : '') + ')</span>'));
+  (rt.phones || []).forEach(x => rtLines.push('Phone: ' + escHtml(x.number)));
+  ['whatsapp', 'instagram', 'facebook'].forEach(k => (rt[k] || []).forEach(l => {
+    const u = safeHref(l.url);
+    rtLines.push(k.charAt(0).toUpperCase() + k.slice(1) + ': ' + (u ? '<a href="' + u + '" target="_blank" rel="noopener noreferrer">' + escHtml(l.url) + '</a>' : escHtml(l.url)));
+  }));
+  (rt.contact_form_pages || []).forEach(u0 => { const u = safeHref(u0);
+    rtLines.push('Contact form: ' + (u ? '<a href="' + u + '" target="_blank" rel="noopener noreferrer">' + escHtml(u0) + '</a>' : escHtml(u0))); });
+  if (rtLines.length) {
+    h += '<details><summary>Ways to reach them (' + rtLines.length + ')</summary><ul class="q-facts">' +
+      rtLines.map(x => '<li>' + x + '</li>').join('') +
+      '</ul><div class="muted">Published on their own pages. Not verified, and nothing is sent to these from here.</div></details>';
+  }
   if (c.state === 'disqualified') {
     h += '<p class="muted">' + escHtml(c.disqualified_reason || 'Disqualified.') + '</p>';
   } else {

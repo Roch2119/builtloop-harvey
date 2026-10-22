@@ -495,6 +495,7 @@ async def get_qualification():
                 "offer_fit": {"decision": fit.get("decision", ""), "reason": fit.get("reason", ""),
                               "offer": (ev.get("offer") or "")},
                 "contact": {"decision": contact.get("decision", ""), "reason": contact.get("reason", "")},
+                "routes": (contact.get("evidence") or {}).get("routes") or {},
                 "facts": ev.get("candidate_facts", []),
                 "inferred": ev.get("inferred_consequences", []),
                 "uncertainty": (fit.get("uncertainty") or []) + (ident.get("uncertainty") or []),

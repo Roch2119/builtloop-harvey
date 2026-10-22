@@ -42,6 +42,7 @@ async def assess_company(state, config, company_id: str, reader: SiteReader | No
     prospects = [p.model_dump() for p in await state.get_contacts_for_company(company_id)]
     contact = assess.assess_contact(
         prospects, bool(getattr(config.channels.email, "send_to_risky", False)))
+    contact["routes"] = assess.contact_routes(pages)     # published routes, for the owner to read
     proposed = assess.propose_state(identity, fit)
     gate = await state.record_assessment_outcome(
         company_id, run_id, identity, fit, contact, proposed, auto_qualify=qcfg.auto_qualify)

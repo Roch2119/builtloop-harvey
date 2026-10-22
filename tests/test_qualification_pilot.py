@@ -488,3 +488,25 @@ def test_a_timeout_is_retried_once_then_reported_as_incomplete():
     bad = {"kind": "booking", "requested_url": "https://pawsgroom.test/shop/", "error": err, "http_status": 0}
     fit = assess_with_pages = assess.assess_offer_fit({"name": "x"}, [bad], {"name": {"confirmed": "Paws"}}, 2026)
     assert fit["decision"] == "review" and fit["reason"].startswith("Incomplete: 1 page(s)")
+
+
+def test_contact_routes_are_read_from_the_site_and_aggregated():
+    from harvey.site_evidence import extract_page
+    html = ("<html><body><p>Call 0161 123 4567 or write to info@pawsgroom.test or paws.owner@gmail.com. "
+            "Logo img@2x.png</p><a href='mailto:Hello@pawsgroom.test?subject=Hi'>Email</a>"
+            "<a href='https://wa.me/447000000000?text=x'>WhatsApp</a>"
+            "<a href='https://www.instagram.com/pawsgroom/?hl=en'>IG</a>"
+            "<a href='https://www.instagram.com/p/abc123/'>post</a>"
+            "<form><textarea name='message'></textarea></form></body></html>")
+    rec = extract_page(html, "https://pawsgroom.test/contact", "contact")
+    addrs = {e["address"]: e for e in rec.emails}
+    assert addrs["hello@pawsgroom.test"]["source"] == "mailto link" and addrs["hello@pawsgroom.test"]["on_domain"]
+    assert addrs["paws.owner@gmail.com"]["freemail"] and not addrs["paws.owner@gmail.com"]["on_domain"]
+    assert not any(a.endswith(".png") or "2x" in a for a in addrs)
+    kinds = {(l["type"], l["url"]) for l in rec.contact_links}
+    assert ("whatsapp", "https://wa.me/447000000000") in kinds          # query string dropped
+    assert ("instagram", "https://instagram.com/pawsgroom/") in kinds
+    assert not any("abc123" in u for _, u in kinds)                    # a post is not the business account
+    assert rec.has_contact_form
+    routes = assess.contact_routes([rec.__dict__])
+    assert routes["emails"][0]["on_domain"] and routes["contact_form_pages"]

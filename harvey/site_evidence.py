@@ -21,7 +21,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from urllib.parse import urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -133,6 +133,9 @@ class PageRecord:
     dated_items: list[dict] = field(default_factory=list)  # {date_text, year, month, quote, price, offer_button}
     access_challenge: bool = False                         # served a bot-check page, not the site
     price_text_seen: bool = False
+    emails: list[dict] = field(default_factory=list)       # {address, source, on_domain, freemail}
+    contact_links: list[dict] = field(default_factory=list)  # {type: whatsapp|instagram|facebook|form, url}
+    has_contact_form: bool = False                         # a form with a message box or email field
     links: list[dict] = field(default_factory=list)        # {href, text, same_site}
     fetched_at: str = ""
 
@@ -231,6 +234,68 @@ def _copyright_quote(text: str, start: int, end: int) -> str:
     return re.sub(r"\s+", " ", tail).strip()
 
 
+_EMAIL_RE = re.compile(r"[a-z0-9][a-z0-9._%+\-]*@[a-z0-9\-]+(?:\.[a-z0-9\-]+)*\.[a-z]{2,}", re.I)
+_EMAIL_JUNK = re.compile(r"\.(?:png|jpe?g|gif|webp|svg|css|js)$|@(?:sentry|wixpress|example|domain|email)\.|"
+                         r"^(?:you|your|name|user|email|john\.?doe)@", re.I)
+_FREEMAIL = frozenset({"gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "hotmail.co.uk", "live.com",
+                       "yahoo.com", "yahoo.co.uk", "icloud.com", "me.com", "aol.com", "msn.com",
+                       "proton.me", "protonmail.com"})
+_SOCIAL_SKIP = ("/p/", "/reel", "/explore", "/share", "/sharer", "/tr?", "/plugins", "/dialog", "/stories")
+
+
+def _emails_on_page(soup, text: str, own_domain: str) -> list[dict]:
+    """Addresses the page itself publishes: mailto links, structured data, visible text."""
+    found: dict[str, str] = {}
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if href.lower().startswith("mailto:"):
+            addr = unquote(href[7:].split("?")[0]).strip().lower()
+            if _EMAIL_RE.fullmatch(addr):
+                found.setdefault(addr, "mailto link")
+    for entry in _jsonld_entries(soup):
+        em = str(entry.get("email") or "").lower().replace("mailto:", "").strip()
+        if _EMAIL_RE.fullmatch(em):
+            found.setdefault(em, "structured data")
+    for m in _EMAIL_RE.finditer(text):
+        found.setdefault(m.group(0).lower(), "page text")
+    out = []
+    for addr, source in found.items():
+        if _EMAIL_JUNK.search(addr):
+            continue
+        dom = addr.rsplit("@", 1)[1]
+        on = bool(own_domain) and (dom == own_domain or dom.endswith("." + own_domain))
+        out.append({"address": addr, "source": source, "on_domain": on, "freemail": dom in _FREEMAIL})
+    return out[:6]
+
+
+def _contact_links(soup, base: str) -> list[dict]:
+    out, seen = [], set()
+    for a in soup.find_all("a", href=True):
+        href = urljoin(base, a["href"].strip())
+        host = urlparse(href).netloc.lower().removeprefix("www.")
+        path = urlparse(href).path
+        kind = ""
+        if host in ("wa.me", "api.whatsapp.com", "web.whatsapp.com", "wa.link") or host.endswith("whatsapp.com"):
+            kind = "whatsapp"
+        elif host.endswith("instagram.com") and path.strip("/") and not any(k in href for k in _SOCIAL_SKIP):
+            kind = "instagram"
+        elif host.endswith("facebook.com") and path.strip("/") and not any(k in href for k in _SOCIAL_SKIP):
+            kind = "facebook"
+        if kind:
+            clean = f"{urlparse(href).scheme}://{host}{path}"       # no query string
+            if clean not in seen:
+                seen.add(clean)
+                out.append({"type": kind, "url": clean[:200]})
+    return out[:6]
+
+
+def _has_contact_form(soup) -> bool:
+    for form in soup.find_all("form"):
+        if form.find("textarea") or form.find("input", attrs={"type": "email"}):
+            return True
+    return False
+
+
 def extract_page(html: str, final_url: str, kind: str, requested_url: str = "",
                  http_status: int = 200, base_host: str = "") -> PageRecord:
     """Turn fetched HTML into a PageRecord. Pure: no network."""
@@ -306,6 +371,9 @@ def extract_page(html: str, final_url: str, kind: str, requested_url: str = "",
             rec.quotes.append({"type": qtype, "quote": _snippet(text, m.start(), m.end())})
             break
     rec.price_text_seen = bool(_PRICE_RE.search(text))
+    rec.emails = _emails_on_page(soup, text, domain_of(final_url or requested_url))
+    rec.contact_links = _contact_links(soup, final_url or requested_url)
+    rec.has_contact_form = _has_contact_form(soup)
     rec.dated_items = _dated_items(text)
     years = [(int(m.group(2) or m.group(1)), _copyright_quote(text, m.start(), m.end()))
              for m in _COPYRIGHT_RE.finditer(text)]

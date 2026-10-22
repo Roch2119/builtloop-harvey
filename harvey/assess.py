@@ -535,6 +535,32 @@ def identity_facts(identity: dict) -> list[dict]:
     return out
 
 
+def contact_routes(pages: list[dict]) -> dict:
+    """Every way into the business that its own pages publish. For the owner to
+    read and for manual outreach: nothing here is verified or used to send."""
+    emails: dict[str, dict] = {}
+    phones: dict[str, str] = {}
+    social: dict[str, dict] = {}
+    forms: list[str] = []
+    for p in _good_pages(pages):
+        url = p.get("final_url") or p.get("requested_url") or ""
+        for e in p.get("emails") or []:
+            emails.setdefault(e["address"], {**e, "url": url})
+        for ph in p.get("phones") or []:
+            phones.setdefault(ph, url)
+        for l in p.get("contact_links") or []:
+            social.setdefault(l["url"], {**l, "found_on": url})
+        if p.get("has_contact_form") and url not in forms:
+            forms.append(url)
+    order = lambda e: (not e["on_domain"], e["freemail"], e["address"])
+    return {"emails": sorted(emails.values(), key=order),
+            "phones": [{"number": n, "url": u} for n, u in phones.items()][:4],
+            "whatsapp": [l for l in social.values() if l["type"] == "whatsapp"],
+            "instagram": [l for l in social.values() if l["type"] == "instagram"],
+            "facebook": [l for l in social.values() if l["type"] == "facebook"],
+            "contact_form_pages": forms[:3]}
+
+
 def assess_contact(prospects: list[dict], allow_risky: bool) -> dict:
     """Contact eligibility under the existing email policy (nothing is changed)."""
     rows = []
