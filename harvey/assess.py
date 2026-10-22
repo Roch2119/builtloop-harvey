@@ -111,7 +111,11 @@ def _sentence_quote(text: str, start: int, end: int, limit: int = 160) -> str:
         while b > end and b < len(text) and not text[b].isspace():
             b -= 1
     q = re.sub(r"\s+", " ", text[a:b]).strip()
-    return "" if len(_NAV_WORDS.findall(q)) >= 3 else q
+    words = q.split()
+    title_case = sum(1 for w in words if w[:1].isupper())
+    if len(_NAV_WORDS.findall(q)) >= 3 or (len(words) >= 6 and title_case / len(words) > 0.6):
+        return ""             # a menu or a run of headings, not a sentence
+    return q
 
 
 def _good_pages(pages: list[dict]) -> list[dict]:
