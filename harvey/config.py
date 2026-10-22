@@ -158,6 +158,10 @@ class EmailChannelConfig(BaseModel):
     # Kill switch: pause all sending when bounces exceed this fraction of
     # sent mail (measured over the trailing sends). 0 disables the switch.
     max_bounce_rate: float = 0.05
+    # When a business publishes no mailbox on its own domain, also accept a
+    # gmail/hotmail-style address printed on its own site (verified before any
+    # send). Skipped automatically for UK/EU country domains. Off by default.
+    accept_freemail_inbox: bool = False
     # New domain? Ramp cold email up slowly (see WarmupConfig). Native
     # providers only: Instantly has its own warmup and per-account limits.
     warmup: WarmupConfig = WarmupConfig()

@@ -54,6 +54,10 @@ JUNK_DOMAIN_PATTERNS = tuple(re.compile(p, re.I) for p in (
     r"(^|\.)(indeed|glassdoor|ziprecruiter|craigslist|zillow|realtor)\.",
     r"(^|\.)(mapquest|foursquare|tripadvisor|trustpilot|birdeye|expertise)\.",
     r"(directory|listings?|find-?a-|top\d+|best-?of)\.",
+    # booking marketplaces & review/directory sites seen in beauty, pet and cleaning results
+    r"(^|\.)(whatclinic|treatwell|fresha|booksy|yell|cylex|doctify|saveface|checkatrade)\.",
+    r"(^|\.)(ratedpeople|bark|groupon|wowcher|rover|wagwalking|care|hotfrog|brownbook|opentable)\.",
+    r"(^|\.)(vagaro|styleseat|schedulicity|mindbodyonline|setmore|square\.site|glossgenius)\.",
     # media & reference
     r"(^|\.)(wikipedia|reddit|quora|medium|substack|forbes|inc|entrepreneur)\.",
     r"(news|magazine|journal|gazette|tribune|herald)\.(com|org|net)$",

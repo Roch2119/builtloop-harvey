@@ -68,6 +68,29 @@ INBOX_PREFERRED = ("owner", "office", "info", "contact", "contactus", "hello",
                    "team", "service", "sales", "estimates", "quotes",
                    "inquiries", "enquiries", "admin", "support")
 INBOX_ADDRESS = re.compile(r"[a-z0-9._+\-]+@[a-z0-9.\-]+\.[a-z]{2,}")
+
+# Free-mail fallback. Many owner-run businesses publish a gmail/hotmail address
+# on their own site instead of a mailbox on their domain. Used only when the
+# company has no usable on-domain inbox, only when printed on the company's own
+# pages, and still verified before anything is sent (see verify_published_address).
+FREEMAIL_DOMAINS = frozenset({
+    "gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "hotmail.co.uk",
+    "live.com", "live.co.uk", "yahoo.com", "yahoo.co.uk", "icloud.com", "me.com",
+    "aol.com", "msn.com", "proton.me", "protonmail.com",
+})
+# Placeholder or template text that is never a real mailbox.
+FREEMAIL_PLACEHOLDER_LOCALS = frozenset({
+    "example", "name", "email", "your", "yourname", "youremail", "user", "username",
+    "test", "demo", "mail", "someone", "john.doe", "jane.doe", "johndoe", "janedoe",
+    "you", "me", "hello.world", "noreply", "no-reply", "donotreply", "webmaster",
+})
+# Personal addresses of sole traders are individually protected under consent
+# regimes such as the UK's PECR and the EU's ePrivacy rules, so the free-mail
+# fallback is skipped for these country domains. A heuristic, not legal advice.
+STRICT_CONSENT_TLDS = (
+    ".uk", ".de", ".fr", ".es", ".it", ".nl", ".be", ".ie", ".eu", ".at", ".dk",
+    ".se", ".fi", ".pt", ".pl", ".ca",
+)
 MAX_PROSPECTS_PER_CYCLE = 25
 
 # Hunter domain-searches per heartbeat. The monthly budget itself is shared
@@ -1492,6 +1515,8 @@ Respond ONLY with the JSON array."""
         guessed one, and it is verified like any other before sending.
         """
         email = await self._find_inbox_address(domain)
+        if not email and getattr(self.config.channels.email, "accept_freemail_inbox", False):
+            email = await self._find_freemail_address(domain)
         if not email:
             return None
         try:
@@ -1554,6 +1579,56 @@ Respond ONLY with the JSON array."""
         if not candidates:
             return ""
         return min(candidates, key=lambda a: INBOX_PREFERRED.index(a.partition("@")[0]))
+
+    async def _find_freemail_address(self, domain: str) -> str:
+        """A gmail/hotmail-style address printed on the company's own site.
+
+        Only a fallback for small businesses with no mailbox on their own
+        domain. Skipped for country domains with strict consent rules, and for
+        placeholder text. Prefers an explicit mailto: link over loose text.
+        """
+        domain = domain.lower().removeprefix("www.")
+        if domain.endswith(STRICT_CONSENT_TLDS):
+            return ""
+        base, home = await self._resolve_base_url(domain)
+        if not base:
+            return ""
+        pages = [home] if home is not None else []
+        for path in INBOX_PAGES:
+            resp = await self._fetch(f"{base}{path}", timeout=SCRAPE_TIMEOUT, retries=1)
+            if resp is not None:
+                pages.append(resp)
+
+        mailto: list[str] = []
+        loose: list[str] = []
+        for resp in pages:
+            text = getattr(resp, "text", "") or ""
+            soup = self._safe_soup(text)
+            if soup is not None:
+                for a in soup.find_all("a", href=True):
+                    href = self._attr_str(a.get("href"))
+                    if href.lower().startswith("mailto:"):
+                        mailto.append(unquote(href[7:].split("?")[0]).lower())
+            loose.append(unquote(text[:50000]).lower())
+
+        def _usable(addr: str) -> str:
+            addr = addr.strip().rstrip(".")
+            local, _, adomain = addr.partition("@")
+            if adomain not in FREEMAIL_DOMAINS:
+                return ""
+            if local in FREEMAIL_PLACEHOLDER_LOCALS or len(local) < 3:
+                return ""
+            return addr
+
+        for chunk in mailto:
+            for addr in INBOX_ADDRESS.findall(chunk):
+                if _usable(addr):
+                    return _usable(addr)
+        for chunk in loose:
+            for addr in INBOX_ADDRESS.findall(chunk):
+                if _usable(addr):
+                    return _usable(addr)
+        return ""
 
     # ── Strategy 4: Job boards — companies hiring for signal roles ──
 
