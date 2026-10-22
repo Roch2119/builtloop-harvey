@@ -230,7 +230,12 @@ def uncertainties(pages: list[dict]) -> list[dict]:
     out: list[dict] = []
     for p in pages:
         url = p.get("final_url") or p.get("requested_url") or ""
-        if p.get("error"):
+        if p.get("access_challenge"):
+            out.append({"type": "access_challenge", "url": p.get("requested_url", ""),
+                        "text": f"{p.get('kind')} page not read: the site served a bot-check page (HTTP "
+                                f"{p.get('http_status')}). This is an access limit of Harvey's plain fetch, "
+                                "not a statement about the business or its site; look at it in a browser."})
+        elif p.get("error"):
             out.append({"type": "fetch_failed", "url": p.get("requested_url", ""),
                         "text": f"{p.get('kind')} page not read: {p['error']}"})
         elif p.get("redirected_off_domain"):
@@ -302,6 +307,10 @@ def assess_identity(company: dict, pages: list[dict], cfg=None) -> dict:
 
 
 _OFFERS = {
+    "dated_item": ("a page showing which dated courses or events are currently running, with a clear enquiry "
+                   "or waitlist step",
+                   "a visitor may not be able to tell whether a dated course or event is still running, so some "
+                   "may not enquire or book"),
     "call_to_book": ("an online booking request form on their own site",
                      "customers can only book by calling or messaging in working hours, so enquiries outside "
                      "those hours may go unanswered"),
@@ -318,13 +327,19 @@ _OFFERS = {
     "single_page": ("a fuller site with services, prices and booking pages",
                     "there is little for a visitor to read before deciding to get in touch"),
 }
-_FIT_ORDER = ("call_to_book", "social_booking", "price_on_request", "not_https", "no_viewport",
+# A fit "pass" needs a specific, observed fact. Weak signals (an old copyright
+# year, few links, no viewport tag) and common calls to action (call to book,
+# "get a quote") are shown to the reviewer but cannot qualify a company alone.
+STRONG_FACTS = frozenset({"dated_item", "not_https"})
+_FIT_ORDER = ("dated_item", "call_to_book", "social_booking", "price_on_request", "not_https", "no_viewport",
               "single_page", "stale_copyright")
 
 
 def assess_offer_fit(company: dict, pages: list[dict], identity: dict, today_year: int | None = None) -> dict:
     """A specific reason an offer could help, or an honest 'not established'."""
-    year = today_year or datetime.now(timezone.utc).year
+    now = datetime.now(timezone.utc)
+    year = today_year or now.year
+    today_month = now.month if year == now.year else 12
     good = _good_pages(pages)
     if identity.get("decision") == "fail" or not good:
         return {"decision": "review", "reason": "Not assessed: the site could not be read or the company "
@@ -334,12 +349,28 @@ def assess_offer_fit(company: dict, pages: list[dict], identity: dict, today_yea
     observed = max(p.get("fetched_at", "") for p in good)
     renders = not any(p.get("needs_rendering") for p in good)
     facts: list[dict] = []
+    # A phone or message CTA says nothing about a missing booking system when
+    # the site also links to, embeds or pops up a booking tool.
+    has_booking_path = any(p.get("booking_links") or p.get("booking_popup") for p in good)
+    suppressed: list[str] = []
     for p in good:
         url = p.get("final_url") or p.get("requested_url") or ""
         for q in p.get("quotes") or []:
-            if q["type"] in _OFFERS:
-                facts.append(_fact(q["type"], f"The {p['kind']} page says: “{q['quote']}”", url, q["quote"],
-                                   p.get("fetched_at", observed), writer_usable=True))
+            if q["type"] not in _OFFERS:
+                continue
+            if q["type"] in ("call_to_book", "social_booking") and has_booking_path:
+                suppressed.append(q["quote"])
+                continue
+            facts.append(_fact(q["type"], f"The {p['kind']} page says: “{q['quote']}”", url, q["quote"],
+                               p.get("fetched_at", observed), writer_usable=True))
+        for d in p.get("dated_items") or []:
+            past = (d["year"], d.get("month") or 12) < (year, today_month)
+            if not past:
+                continue
+            facts.append(_fact("dated_item",
+                               f"The {p['kind']} page lists “{d['quote']}” (dated {d['date_text']}) with a "
+                               f"“{d['offer_button']}” button.", url, d["quote"],
+                               p.get("fetched_at", observed), writer_usable=True))
     if (home.get("final_url") or "").startswith("http://"):
         facts.append(_fact("not_https", "The homepage loaded over http:// (no HTTPS).", home["final_url"],
                            home["final_url"], home.get("fetched_at", observed)))
@@ -360,11 +391,20 @@ def assess_offer_fit(company: dict, pages: list[dict], identity: dict, today_yea
         for link in p.get("booking_links") or []:
             context.append(_fact("booking_tool_link", "The site links to a third-party booking tool.", link, link,
                                  p.get("fetched_at", observed), writer_usable=False))
+    for p in good:
+        if p.get("booking_popup"):
+            context.append(_fact("booking_popup", "A booking button on the site opens an on-page form.",
+                                 p.get("final_url", ""), "", p.get("fetched_at", observed), writer_usable=False))
+            break
+    for qtext in suppressed[:2]:
+        context.append(_fact("call_to_book_also", "The site also mentions calling to book, alongside a booking tool.",
+                             home.get("final_url", ""), qtext, observed, writer_usable=False))
     not_detected: list[dict] = []
     scope = (f"Checked {len(good)} page(s): " + ", ".join(p.get('final_url', '') for p in good) +
              ". Static HTML only, nothing rendered.")
     if renders:
-        if not any(p.get("booking_links") or any(q["type"] in ("call_to_book", "social_booking") for q in p.get("quotes", []))
+        if not any(p.get("booking_links") or p.get("booking_popup")
+                   or any(q["type"] in ("call_to_book", "social_booking") for q in p.get("quotes", []))
                    for p in good):
             not_detected.append(_fact("booking_path_not_detected",
                                       "No booking link, widget wording or booking page was detected.",
@@ -374,16 +414,26 @@ def assess_offer_fit(company: dict, pages: list[dict], identity: dict, today_yea
                                       home["final_url"], "", observed, polarity="not_detected", scope=scope))
 
     ranked = sorted(facts, key=lambda f: _FIT_ORDER.index(f["type"]) if f["type"] in _FIT_ORDER else 99)
-    if ranked:
-        top = ranked[:3]
+    strong = [f for f in ranked if f["type"] in STRONG_FACTS]
+    if strong:
+        top = strong[:3]
         consequences = [{"fact_id": f["id"], "offer": _OFFERS[f["type"]][0],
-                         "inference": _OFFERS[f["type"]][1], "kind": "inferred, not observed"} for f in top]
+                         "inference": _OFFERS[f["type"]][1], "kind": "inferred, not observed (hypothesis)"}
+                        for f in top]
         reason = ("Observed: " + " ".join(f["text"] for f in top) + " Inferred (not observed): " +
                   " ".join(c["inference"] + "." for c in consequences))
         return {"decision": "pass", "reason": reason, "offer": consequences[0]["offer"],
                 "observed_facts": ranked, "inferred_consequences": consequences,
                 "context_facts": context, "not_detected": not_detected,
                 "uncertainty": uncertainties(pages), "observed_at": observed}
+    if ranked:
+        # Only weak or common signals: shown to the person, never a pass.
+        return {"decision": "review",
+                "reason": "Only weak or common signals were observed (" +
+                          "; ".join(f["type"].replace("_", " ") for f in ranked) +
+                          "). On their own they are not a reason for an offer; a person should look at the site.",
+                "offer": "", "observed_facts": ranked, "inferred_consequences": [], "context_facts": context,
+                "not_detected": not_detected, "uncertainty": uncertainties(pages), "observed_at": observed}
     if not_detected:
         return {"decision": "review",
                 "reason": "No positively observed gap. Possible gaps were NOT DETECTED in the pages read "

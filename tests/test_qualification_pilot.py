@@ -28,8 +28,10 @@ HOME = """<html><head><title>Northside Dog Grooming | Manchester</title>
 <p>Professional dog grooming and dog washing at 12 High Street, Manchester M1 1AA.
 Call us on 0161 555 0100 to book your dog in. We have groomed dogs across Manchester for ten years and
 love every breed that comes through our door, big or small, fluffy or short coated.</p>
-<a href="/about">About</a><a href="/contact">Contact</a><a href="/services">Services</a>
+<a href="/about">About</a><a href="/contact">Contact</a><a href="/services">Services</a><a href="/shop">Shop</a>
 </body></html>"""
+SHOP = ("<html><head><title>Shop courses</title></head><body><h1>Courses</h1><ul><li>15-16 January 2023 Masterclass "
+        "£833.33 ADD TO CART</li><li>Basic course six days £3,958.33 ADD TO CART</li></ul>" + "More text. " * 40 + "</body></html>")
 ABOUT = "<html><head><title>About</title></head><body><h1>About us</h1><p>Family run dog groomers in Manchester since 2014. " + "We care. " * 30 + "</p></body></html>"
 
 
@@ -58,14 +60,15 @@ async def grooming(state, domain="northsidegrooming.test"):
 
 
 async def assess_with(state, config, cid, handlers, domain="northsidegrooming.test"):
-    reader = SiteReader(5, 0, client=site(handlers))
+    reader = SiteReader(7, 0, client=site(handlers))
     return await qualify_run.assess_company(state, config, cid, reader=reader)
 
 
 GOOD_SITE = {f"https://northsidegrooming.test": HOME,
              "https://northsidegrooming.test/about": ABOUT,
              "https://northsidegrooming.test/contact": ABOUT,
-             "https://northsidegrooming.test/services": ABOUT}
+             "https://northsidegrooming.test/services": ABOUT,
+             "https://northsidegrooming.test/shop": SHOP}
 
 
 # ── evidence, uncertainty ──
@@ -301,3 +304,110 @@ async def test_an_existing_v12_database_upgrades_in_place(tmp_path):
     assert {"page_evidence", "qualification_assessments"} <= {r[0] for r in con.execute("SELECT name FROM sqlite_master")}
     con.close()
     assert await st.company_gate_state("c1") == "unassessed"
+
+
+# ── research-quality rules found by the first real capture ──
+
+def page(**kw):
+    base = {"kind": "home", "final_url": "https://pawsgroom.test/", "requested_url": "https://pawsgroom.test", "http_status": 200,
+            "error": "", "needs_rendering": False, "redirected_off_domain": False, "text_len": 900,
+            "has_viewport": True, "copyright_year": 0, "quotes": [], "links": [], "booking_links": [],
+            "fetched_at": "2026-10-22T12:00:00", "title": "X Dog Grooming", "h1": "Dog grooming in Manchester",
+            "headings": [], "text_excerpt": "dog grooming Manchester"}
+    base.update(kw)
+    return base
+
+
+CO = {"name": "Paws Grooming", "domain": "pawsgroom.test", "industry": "dog groomer", "location": "Manchester"}
+
+
+def fit_of(*pages):
+    ident = assess.assess_identity(CO, list(pages))
+    return assess.assess_offer_fit(CO, list(pages), ident, 2026)
+
+
+def test_weak_signals_alone_never_pass():
+    for kw in ({"copyright_year": 2020},
+               {"links": [{"href": "https://pawsgroom.test/a", "text": "a", "same_site": True}]},
+               {"has_viewport": False},
+               {"quotes": [{"type": "call_to_book", "quote": "call to book"}]},
+               {"quotes": [{"type": "price_on_request", "quote": "prices on request"}]}):
+        fit = fit_of(page(**kw))
+        assert fit["decision"] == "review", kw
+        assert fit["inferred_consequences"] == []
+        assert assess.propose_state({"decision": "pass"}, fit) == "needs_review"
+
+
+def test_a_call_to_book_is_dropped_when_the_site_has_a_booking_path():
+    quote = {"type": "call_to_book", "quote": "Book Now call to book"}
+    for extra in ({"booking_links": ["https://shop.phorest.com/x"]}, {"booking_popup": True}):
+        fit = fit_of(page(quotes=[quote], **extra))
+        assert not [f for f in fit["observed_facts"] if f["type"] == "call_to_book"]
+        assert [f for f in fit["context_facts"] if f["type"] == "call_to_book_also"]
+
+
+def test_a_past_dated_item_with_a_buy_button_is_a_strong_observed_fact():
+    item = {"date_text": "15-16 January 2023", "year": 2023, "month": 1, "offer_button": "ADD TO CART",
+            "quote": "15-16 January 2023 Online Masterclass £833.33 ADD TO CART", "price": "£833.33"}
+    fit = fit_of(page(kind="shop", dated_items=[item]))
+    assert fit["decision"] == "pass"
+    f = [x for x in fit["observed_facts"] if x["type"] == "dated_item"][0]
+    assert f["quote"] == item["quote"] and f["writer_usable"] and f["observed_at"]
+    assert "hypothesis" in fit["inferred_consequences"][0]["kind"]
+    assert "stale" not in f["text"].lower() and "outdated" not in f["text"].lower()
+    future = dict(item, year=2027, date_text="3 March 2027", month=3)
+    assert fit_of(page(kind="shop", dated_items=[future]))["decision"] == "review"
+
+
+def test_extractor_reads_dated_items_embeds_popups_and_clean_quotes():
+    from harvey.site_evidence import extract_page
+    html = ("<html><head><title>Shop</title></head><body><h1>Shop</h1>"
+            "<iframe src='https://app.zenmaid.com/book/x'></iframe>"
+            "<a href='#elementor-action:popup' role=button>BOOK YOUR TREATMENT</a>"
+            "<p>15-16 January 2023 Online Permanent Makeup Masterclass £1,083.33 ADD TO CART</p>"
+            "<p>Great groomers, thanks Kim S. 7/29/2023 totally recommend.</p>"
+            "<footer>© 2023 by The Hairy Dog. All rights reserved. Contact us now to arrange something</footer>"
+            + "<p>filler text here</p>" * 30 + "</body></html>")
+    rec = extract_page(html, "https://pawsgroom.test/shop", "shop", base_host="pawsgroom.test")
+    assert any("zenmaid.com" in b for b in rec.booking_links)           # embedded tool recognised
+    assert rec.booking_popup
+    assert [d["year"] for d in rec.dated_items] == [2023]               # the numeric review date is ignored
+    assert rec.dated_items[0]["quote"].endswith("ADD TO CART") and rec.dated_items[0]["price"] == "£1,083.33"
+    assert rec.copyright_year == 2023
+    q = rec.copyright_quote
+    assert q == q.strip() and not q.startswith(("e.", "Kim")) and "Hairy Dog" in q
+
+
+def test_get_a_quote_is_not_a_price_on_request_signal():
+    from harvey.site_evidence import extract_page
+    rec = extract_page("<html><body><h1>The Maids</h1>" + "<a href='/q'>GET A QUOTE</a> Call now. " * 5 +
+                       "filler " * 80 + "</body></html>", "https://pawsgroom.test/", "home", base_host="pawsgroom.test")
+    assert not [q for q in rec.quotes if q["type"] == "price_on_request"]
+
+
+@pytest.mark.asyncio
+async def test_a_bot_check_page_is_an_access_limit_not_a_business_problem(state):
+    cid = await grooming(state)
+    blocked = httpx.Response(403, text="<html><title>Just a moment...</title>Checking your browser</html>")
+    r = await assess_with(state, cfg(), cid, {f"https://northsidegrooming.test": blocked,
+                                              "https://www.northsidegrooming.test": blocked,
+                                              "http://northsidegrooming.test": blocked,
+                                              "http://www.northsidegrooming.test": blocked})
+    kinds = {u["type"] for u in r["identity"]["uncertainty"]}
+    assert "access_challenge" in kinds and "fetch_failed" not in kinds
+    assert r["state"] == "needs_review" and (await state.get_company(cid)).disqualified_at is None
+    text = " ".join(u["text"] for u in r["identity"]["uncertainty"])
+    assert "not a statement about the business" in text
+
+
+@pytest.mark.asyncio
+async def test_shop_and_event_pages_are_read_too(state):
+    cid = await grooming(state)
+    handlers = dict(GOOD_SITE)
+    handlers["https://northsidegrooming.test"] = HOME.replace(
+        '<a href="/shop">Shop</a>', '<a href="/shop">Shop</a><a href="/events">Events</a>')
+    handlers["https://northsidegrooming.test/events"] = ABOUT
+    r = await assess_with(state, cfg(), cid, handlers)
+    kinds = [p["kind"] for p in await state.get_page_evidence(cid)]
+    assert "shop" in kinds and "events" in kinds
+    assert r["proposed"] == "qualified"                       # the dated shop item is the specific reason

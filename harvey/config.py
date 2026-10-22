@@ -502,7 +502,7 @@ class QualificationConfig(BaseModel):
     # False: a person approves every company. True: a company whose identity
     # and offer fit both pass is qualified automatically.
     auto_qualify: bool = False
-    max_pages: int = 5                  # homepage + up to 4 relevant linked pages
+    max_pages: int = 7                  # homepage + up to 6 relevant linked pages
     request_delay_seconds: float = 1.0
     # Extra clear mismatches (exact domain or its subdomains), on top of the
     # directory/marketplace/platform patterns discovery already uses.
