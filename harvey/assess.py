@@ -115,7 +115,21 @@ def _sentence_quote(text: str, start: int, end: int, limit: int = 160) -> str:
     title_case = sum(1 for w in words if w[:1].isupper())
     if len(_NAV_WORDS.findall(q)) >= 3 or (len(words) >= 6 and title_case / len(words) > 0.6):
         return ""             # a menu or a run of headings, not a sentence
-    return q
+    # The words right around the match must read as prose. In a menu or a
+    # title/slogan they are Capitalised, in a sentence mostly lower case.
+    near = text[max(0, start - 60):start].split()[-4:] + text[end:end + 60].split()[:4]
+    if sum(1 for w in near if w[:1].islower()) < 3:
+        return ""
+    # Drop leftovers at the front: a state code ("AZ The Hairy Dog…") or a menu
+    # word ("Our Clinic BLOG Insights…").
+    toks = q.split()
+    if len(toks) > 3 and toks[0].isupper() and len(toks[0]) <= 3 and toks[1][:1].isupper():
+        toks = toks[1:]
+    for i, t in enumerate(toks[:6]):
+        if _NAV_WORDS.fullmatch(t.strip(".,:;|-")) and i + 1 < len(toks):
+            toks = toks[i + 1:]
+    q = " ".join(toks)
+    return q if text[start:end].lower() in q.lower() else ""
 
 
 def _good_pages(pages: list[dict]) -> list[dict]:

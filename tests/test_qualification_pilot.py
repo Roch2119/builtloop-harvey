@@ -438,3 +438,22 @@ def test_service_quotes_are_whole_sentences_not_menu_fragments():
     out = assess._services([pg], "brow/pmu studio", {})
     mb = [f for f in out if f["term"] == "microblading"]
     assert mb and mb[0]["quote"].startswith("We offer microblading")
+
+
+def test_quote_cleanup_rejects_menu_and_slogan_text_and_strips_leftovers():
+    sq = assess._sentence_quote
+    menu = "Contact Us Nail Trim & Self-Wash Schedule an appointment for your pup today!"
+    i = menu.find("Trim")
+    assert sq(menu, i, i + 4) == ""
+    slogan = "Home - Nashville K-9 - Nashville Dog Training NASHVILLE'S PREMIER"
+    i = slogan.find("Nashville")
+    assert sq(slogan, i, i + 9) == ""
+    t = "AZ The Hairy Dog is a full-service dog grooming salon serving Phoenix's Arcadia area."
+    i = t.find("Phoenix")
+    assert sq(t, i, i + 7).startswith("The Hairy Dog is a full-service")
+    t = "Our Clinic BLOG Insights and observations on the world of PMU."
+    i = t.find("PMU")
+    assert sq(t, i, i + 3).startswith("Insights and observations")
+    ok = "We offer microblading for natural looking brows in Manchester."
+    i = ok.find("microblading")
+    assert sq(ok, i, i + 12) == ok
