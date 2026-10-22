@@ -68,7 +68,7 @@ def fact_id(ftype: str, url: str, quote: str) -> str:
 
 def _fact(ftype: str, text: str, url: str, quote: str, observed_at: str, *,
           polarity: str = "present", writer_usable: bool = False, scope: str = "") -> dict:
-    return {"id": fact_id(ftype, url, quote or text), "type": ftype, "text": text, "url": url,
+    return {"id": fact_id(ftype, url, f"{quote}||{text}"), "type": ftype, "text": text, "url": url,
             "quote": quote, "observed_at": observed_at, "polarity": polarity,
             "writer_usable": writer_usable, "scope": scope}
 
@@ -91,6 +91,27 @@ def configured_mismatch(domain: str, extra_domains: list[str] | tuple = ()) -> s
 
 def _norm_tokens(text: str) -> set[str]:
     return {t for t in re.findall(r"[a-z0-9]+", (text or "").lower()) if len(t) > 1}
+
+
+_NAV_WORDS = re.compile(r"\b(?:home|services?|about|contact|faq|gallery|book|menu|reviews?|blog|shop|supplies|"
+                        r"appointments?|skip to content|login|log in|sign in)\b", re.I)
+
+
+def _sentence_quote(text: str, start: int, end: int, limit: int = 160) -> str:
+    """The sentence around a match, cut on word boundaries, or "" when what
+    surrounds it is menu/navigation text (a poor thing to quote as evidence)."""
+    lefts = [text.rfind(sep, 0, start) for sep in (". ", "? ", "! ")]
+    a = max(lefts) + 2 if max(lefts) >= 0 else 0
+    rights = [i for i in (text.find(sep, end) for sep in (". ", "? ", "! ")) if i >= 0]
+    b = min(rights) + 1 if rights else len(text)
+    if b - a > limit:
+        a, b = max(a, start - 70), min(b, end + 80)
+        while a < start and a > 0 and not text[a - 1].isspace():
+            a += 1
+        while b > end and b < len(text) and not text[b].isspace():
+            b -= 1
+    q = re.sub(r"\s+", " ", text[a:b]).strip()
+    return "" if len(_NAV_WORDS.findall(q)) >= 3 else q
 
 
 def _good_pages(pages: list[dict]) -> list[dict]:
@@ -186,6 +207,9 @@ def _location(pages: list[dict], target: str, aliases: dict) -> dict:
         for n in names:
             for m in re.finditer(re.escape(n), low):
                 window = text[max(0, m.start() - 110): m.end() + 110]
+                quote = _sentence_quote(text, m.start(), m.end())
+                if not quote:
+                    continue          # only menu text around it: not usable as evidence
                 if _SERVICE_AREA_CUES.search(window):
                     basis = "service_area"
                 elif _ADDRESS_CUES.search(window):
@@ -193,7 +217,7 @@ def _location(pages: list[dict], target: str, aliases: dict) -> dict:
                 else:
                     continue
                 if order[basis] < order[out["basis"]]:
-                    out.update({"basis": basis, "quote": re.sub(r"\s+", " ", window).strip(), "url": url})
+                    out.update({"basis": basis, "quote": quote, "url": url})
                 break
         head = " ".join([p.get("title", ""), p.get("meta_description", ""), p.get("h1", "")])
         if out["basis"] == "none" and any(n in head.lower() for n in names):
@@ -417,9 +441,15 @@ def assess_offer_fit(company: dict, pages: list[dict], identity: dict, today_yea
     strong = [f for f in ranked if f["type"] in STRONG_FACTS]
     if strong:
         top = strong[:3]
-        consequences = [{"fact_id": f["id"], "offer": _OFFERS[f["type"]][0],
-                         "inference": _OFFERS[f["type"]][1], "kind": "inferred, not observed (hypothesis)"}
-                        for f in top]
+        consequences, seen_inf = [], {}
+        for f in top:
+            inf = _OFFERS[f["type"]][1]
+            if inf in seen_inf:
+                seen_inf[inf]["fact_ids"].append(f["id"])
+                continue
+            seen_inf[inf] = {"fact_id": f["id"], "fact_ids": [f["id"]], "offer": _OFFERS[f["type"]][0],
+                             "inference": inf, "kind": "inferred, not observed (hypothesis)"}
+            consequences.append(seen_inf[inf])
         reason = ("Observed: " + " ".join(f["text"] for f in top) + " Inferred (not observed): " +
                   " ".join(c["inference"] + "." for c in consequences))
         return {"decision": "pass", "reason": reason, "offer": consequences[0]["offer"],

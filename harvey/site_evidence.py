@@ -219,6 +219,18 @@ def _dated_items(text: str) -> list[dict]:
     return out
 
 
+def _copyright_quote(text: str, start: int, end: int) -> str:
+    """The copyright notice itself, starting at the (c) sign, never the words
+    before it (which may belong to a review or a menu)."""
+    tail = text[start: end + 45]
+    cut = tail.find(". ", end - start)
+    if cut > 0:
+        tail = tail[: cut + 1]
+    elif end + 45 < len(text) and not text[end + 45].isspace():
+        tail = tail.rsplit(" ", 1)[0] if " " in tail[end - start:] else tail
+    return re.sub(r"\s+", " ", tail).strip()
+
+
 def extract_page(html: str, final_url: str, kind: str, requested_url: str = "",
                  http_status: int = 200, base_host: str = "") -> PageRecord:
     """Turn fetched HTML into a PageRecord. Pure: no network."""
@@ -252,7 +264,13 @@ def extract_page(html: str, final_url: str, kind: str, requested_url: str = "",
         if not href.startswith(("http://", "https://")):
             continue
         host = domain_of(href)
+        own = domain_of(base)
         if any(h in host for h in BOOKING_HOSTS):
+            if href not in rec.booking_links:
+                rec.booking_links.append(href[:200])
+        elif (own and host != own and host.endswith("." + own)
+              and re.search(r"\bbook\b|appointment|reserve", a.get_text(), re.I)):
+            # their own booking app on a sub-domain (app.example.com)
             if href not in rec.booking_links:
                 rec.booking_links.append(href[:200])
         links.append({"href": href[:300], "text": _clean(a.get_text())[:80],
@@ -289,7 +307,7 @@ def extract_page(html: str, final_url: str, kind: str, requested_url: str = "",
             break
     rec.price_text_seen = bool(_PRICE_RE.search(text))
     rec.dated_items = _dated_items(text)
-    years = [(int(m.group(2) or m.group(1)), _snippet(text, m.start(), m.end(), 20))
+    years = [(int(m.group(2) or m.group(1)), _copyright_quote(text, m.start(), m.end()))
              for m in _COPYRIGHT_RE.finditer(text)]
     if years:
         rec.copyright_year, rec.copyright_quote = max(years)

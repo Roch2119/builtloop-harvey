@@ -411,3 +411,21 @@ async def test_shop_and_event_pages_are_read_too(state):
     kinds = [p["kind"] for p in await state.get_page_evidence(cid)]
     assert "shop" in kinds and "events" in kinds
     assert r["proposed"] == "qualified"                       # the dated shop item is the specific reason
+
+
+def test_copyright_quote_starts_at_the_sign_and_subdomain_booking_counts():
+    from harvey.site_evidence import extract_page
+    html = ("<html><body><p>Great groomer. Kim S. 7/29/2023 © 2023 by The Hairy Dog. Proudly created.</p>"
+            "<a href='https://app.pawsgroom.test/contact'>Book Now</a></body></html>")
+    rec = extract_page(html, "https://pawsgroom.test/", "home")
+    assert rec.copyright_quote.startswith("© 2023")
+    assert "Kim" not in rec.copyright_quote
+    assert rec.booking_links == ["https://app.pawsgroom.test/contact"]
+
+
+def test_fact_ids_are_unique_and_consequences_are_not_repeated():
+    q = "We offer grooming and bathing for dogs."
+    a = assess._fact("service", "grooming", "https://pawsgroom.test/", q, "observed")
+    b = assess._fact("service", "bathing", "https://pawsgroom.test/", q, "observed")
+    assert a["id"] != b["id"]
+    assert assess._sentence_quote("Home Services About Contact Book now. Manchester", 5, 13) == ""
