@@ -786,6 +786,44 @@ def cmd_sending(args):
     asyncio.run(_run())
 
 
+def cmd_company(args):
+    """Disqualify / requalify a company, or list the disqualified ones."""
+    from harvey.state import StateManager
+
+    async def _run():
+        state = StateManager()
+        await state.init_db()
+        if args.company_action == "list":
+            rows = await state.list_disqualified_companies()
+            if not rows:
+                print("\n  No disqualified companies.\n")
+            for r in rows:
+                print(f"  {r['id']}  {r['name']} ({r['domain']})  since {r['disqualified_at']}"
+                      f"\n      {r['disqualified_reason']}  [{r['disqualified_source']}]")
+            return
+        company = await state.find_company(args.company)
+        if not company:
+            print(f"\n  No company matches '{args.company}'. Use its id, domain or exact name.\n")
+            return
+        if args.company_action == "disqualify":
+            if not args.reason.strip():
+                print("\n  Say why: --reason \"directory, not a business\"\n")
+                return
+            r = await state.disqualify_company(company["id"], args.reason, source="cli")
+            print(f"\n  {company['name']} disqualified. Cancelled {r['cancelled_outbox']} "
+                  f"queued email(s); {r['prospects_blocked']} contact(s) parked. "
+                  "History kept. Undo with: harvey company requalify\n")
+        else:
+            r = await state.requalify_company(company["id"], note=args.reason)
+            if not r.get("changed"):
+                print(f"\n  {company['name']} was not disqualified.\n")
+            else:
+                print(f"\n  {company['name']} re-enabled. {r['prospects_released']} contact(s) "
+                      "back to 'new'. Cancelled emails stay cancelled.\n")
+
+    asyncio.run(_run())
+
+
 def main():
     from harvey.textio import utf8_stdio
     utf8_stdio()
@@ -928,6 +966,14 @@ def main():
     sub.add_argument("sending_action", nargs="?", default="status",
                      choices=["pause", "resume", "status"])
     sub.set_defaults(func=cmd_sending)
+
+    sub = subparsers.add_parser(
+        "company", help="Disqualify or re-enable a company (blocks all outreach to it)")
+    sub.add_argument("company_action", choices=["disqualify", "requalify", "list"])
+    sub.add_argument("company", nargs="?", default="",
+                     help="Company id, domain or exact name")
+    sub.add_argument("--reason", default="", help="Why (required to disqualify)")
+    sub.set_defaults(func=cmd_company)
 
     sub = subparsers.add_parser(
         "warmup", help="Check if your sending domain is set up and warmed up for cold email")

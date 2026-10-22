@@ -14,12 +14,13 @@ import logging
 import re
 from datetime import datetime, timezone
 
+from harvey import qualification as qual
 from harvey.brain import Brain
 from harvey.config import HarveyConfig
 from harvey.humanize import humanize, humanizer_enabled
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS
 from harvey.models.campaign import Campaign, EmailStep
-from harvey.state import WRITABLE_EMAIL_STATUSES, StateManager
+from harvey.state import StateManager
 
 logger = logging.getLogger("harvey.writer")
 
@@ -62,19 +63,31 @@ class Writer:
         # Load foundational skills for this agent
         self.skills = self.brain.load_skills_for_agent("writer")
 
+        # Settle eligibility BEFORE any model call: prospects at a disqualified
+        # company, or whose address the sending policy blocks (invalid,
+        # unknown, guess, catch-all unless send_to_risky), become 'ineligible'
+        # with a recorded reason instead of getting a draft the Sender's gate
+        # would refuse.
+        allow_risky = getattr(self.config.channels.email, "send_to_risky", False)
+        settled = await self.state.apply_eligibility_policy(allow_risky)
+        if any(settled.values()):
+            logger.info(f"Writer: eligibility check: {settled}")
+
         # Get prospects that haven't been contacted yet
         new_prospects = await self.state.get_prospects_by_status("new")
         if not new_prospects:
             logger.info("Writer: No new prospects to write for.")
             return
 
-        # Only write for prospects we can actually deliver to. Guessed and
-        # invalid addresses are skipped so we don't spend Claude calls (or
-        # sending reputation) on mail that will bounce.
-        prospects_with_email = [
-            p for p in new_prospects
-            if p.email and (p.email_status or "guess") in WRITABLE_EMAIL_STATUSES
-        ]
+        # Only write for prospects we can actually send to, by the same rule
+        # the Sender's final check enforces. Never at a disqualified company.
+        prospects_with_email = []
+        for p in new_prospects:
+            if qual.email_block_reason(p.email, p.email_status, allow_risky):
+                continue
+            if await self.state.get_disqualification_for_prospect(p):
+                continue
+            prospects_with_email.append(p)
         if not prospects_with_email:
             logger.info(
                 "Writer: No prospects with deliverable (verified/risky) emails yet."

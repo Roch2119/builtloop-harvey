@@ -22,6 +22,7 @@ from harvey.models.prospect import Prospect
 from harvey.models.campaign import Campaign, EmailStep  # noqa: F401 (EmailStep re-exported)
 from harvey.models.conversation import Conversation, Message  # noqa: F401
 
+from harvey import qualification as qual
 from harvey.paths import PROJECT_ROOT
 
 DB_PATH = PROJECT_ROOT / "data" / "harvey.db"
@@ -435,6 +436,20 @@ MIGRATIONS: list[str] = [
     -- so one subscription's budget never consumes the other's.
     ALTER TABLE usage_log ADD COLUMN codex_calls INTEGER DEFAULT 0;
     """,
+    # ── v12: company-level disqualification + a reason for blocked prospects ──
+    """
+    -- A person (or a "no fit" comment) can mark a whole company as not a fit.
+    -- Nothing is deleted: the row, its contacts and its history stay. Every
+    -- stage (Writer, staging, the Sender's final check) reads these columns.
+    ALTER TABLE companies ADD COLUMN disqualified_at TIMESTAMP DEFAULT NULL;
+    ALTER TABLE companies ADD COLUMN disqualified_reason TEXT DEFAULT '';
+    ALTER TABLE companies ADD COLUMN disqualified_source TEXT DEFAULT '';
+    CREATE INDEX IF NOT EXISTS idx_companies_disqualified
+        ON companies(disqualified_at) WHERE disqualified_at IS NOT NULL;
+
+    -- Why a prospect is 'ineligible' (blocked email status, disqualified company).
+    ALTER TABLE prospects ADD COLUMN status_reason TEXT DEFAULT '';
+    """,
 ]
 
 BRAIN_PROVIDERS = ("claude", "codex")
@@ -677,6 +692,13 @@ class StateManager:
             prospect.id = _new_id()
         prospect.email = _norm(prospect.email)
         prospect.linkedin_url = (prospect.linkedin_url or "").strip()
+        # A new contact at a disqualified company is recorded, never worked.
+        if prospect.status in ("new", "queued"):
+            hit = await self.disqualification_for(
+                company_id=prospect.company_id, email=prospect.email)
+            if hit:
+                prospect.status = "ineligible"
+                prospect.status_reason = qual.disqualified_text(hit["disqualified_reason"])
         async with self._connect() as db:
             cursor = await db.execute(
                 """INSERT OR IGNORE INTO prospects
@@ -684,8 +706,8 @@ class StateManager:
                     email_status, phone, phone_verified, linkedin_url, title,
                     seniority, department, source, source_url, status, score,
                     personalization_notes, company, industry, company_size,
-                    created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    created_at, updated_at, status_reason)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     prospect.id, prospect.company_id,
                     prospect.first_name, prospect.last_name,
@@ -700,6 +722,7 @@ class StateManager:
                     prospect.company, prospect.industry, prospect.company_size,
                     prospect.created_at.isoformat(),
                     prospect.updated_at.isoformat(),
+                    prospect.status_reason,
                 ),
             )
             await db.commit()
@@ -792,6 +815,320 @@ class StateManager:
                 ),
             )
             await db.commit()
+
+    # ── Disqualification & eligibility ──
+    #
+    # A company marked "not a fit" is blocked at every stage: Scout skips it,
+    # new contacts at it are recorded as 'ineligible', the Writer ignores it,
+    # staging skips it, and the Sender's final check refuses anything already
+    # queued or approved. Nothing is deleted. Matching is by company record,
+    # or by the same site domain (duplicate records, other contacts there).
+
+    @staticmethod
+    def _domain_keys(*values: str) -> set[str]:
+        """Site keys that identify a company, minus shared mailbox providers."""
+        return {d for d in (qual.domain_of(v) for v in values)
+                if d and d not in qual.SHARED_MAIL_DOMAINS}
+
+    @staticmethod
+    def _match_disqualified(rows: list[dict], company_id: str, keys: set[str]) -> dict | None:
+        for r in rows:
+            if company_id and r["id"] == company_id:
+                return r
+            if keys & StateManager._domain_keys(r.get("domain") or ""):
+                return r
+        return None
+
+    async def _disqualified_rows(self, db) -> list[dict]:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id, name, domain, disqualified_at, disqualified_reason, "
+            "disqualified_source FROM companies WHERE disqualified_at IS NOT NULL"
+        ) as cursor:
+            return [dict(r) for r in await cursor.fetchall()]
+
+    async def disqualification_for(
+        self, *, company_id: str = "", email: str = "", domain: str = ""
+    ) -> dict | None:
+        """The disqualified company this contact belongs to, or None.
+
+        Matches the contact's own company record, any record with the same
+        site domain (duplicates), and the domain of the contact's email.
+        """
+        async with self._connect() as db:
+            rows = await self._disqualified_rows(db)
+            if not rows:
+                return None
+            own = ""
+            if company_id:
+                async with db.execute(
+                    "SELECT domain FROM companies WHERE id = ?", (company_id,)
+                ) as cursor:
+                    row = await cursor.fetchone()
+                    own = (row[0] if row else "") or ""
+        return self._match_disqualified(
+            rows, company_id, self._domain_keys(email, domain, own))
+
+    async def get_disqualification_for_prospect(self, prospect) -> dict | None:
+        if prospect is None:
+            return None
+        return await self.disqualification_for(
+            company_id=prospect.company_id or "", email=prospect.email or "")
+
+    async def _company_family(self, db, company_id: str) -> tuple[list[str], str]:
+        """This company's id plus every duplicate record with the same domain."""
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id, domain FROM companies") as cursor:
+            rows = [dict(r) for r in await cursor.fetchall()]
+        domain = ""
+        for r in rows:
+            if r["id"] == company_id:
+                domain = qual.domain_of(r["domain"])
+        keys = self._domain_keys(domain)
+        ids = {company_id}
+        if keys:
+            ids |= {r["id"] for r in rows if keys & self._domain_keys(r["domain"])}
+        return sorted(ids), next(iter(keys), "")
+
+    async def _family_prospect_ids(self, db, ids: list[str], domain: str) -> list[str]:
+        marks = ",".join("?" * len(ids))
+        sql = f"SELECT id FROM prospects WHERE company_id IN ({marks})"
+        params: list = list(ids)
+        if domain:
+            sql += " OR LOWER(SUBSTR(email, INSTR(email, '@') + 1)) = ?"
+            params.append(domain)
+        async with db.execute(sql, params) as cursor:
+            return [r[0] for r in await cursor.fetchall()]
+
+    async def disqualify_company(
+        self, company_id: str, reason: str, source: str = "manual"
+    ) -> dict:
+        """Mark a company (and duplicate records of the same site) as not a fit.
+
+        Cancels every email still waiting or approved for anyone there and
+        parks never-contacted contacts as 'ineligible'. Contacts already
+        emailed keep their status and history. Idempotent.
+        """
+        reason = qual.disqualified_text(reason)
+        now = _utcnow().isoformat()
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT id, name FROM companies WHERE id = ?", (company_id,)
+            ) as cursor:
+                company = await cursor.fetchone()
+            if not company:
+                return {"found": False}
+            ids, domain = await self._company_family(db, company_id)
+            marks = ",".join("?" * len(ids))
+            await db.execute(
+                f"UPDATE companies SET disqualified_at = COALESCE(disqualified_at, ?), "
+                f"disqualified_reason = ?, disqualified_source = ?, updated_at = ? "
+                f"WHERE id IN ({marks})",
+                (now, reason, source, now, *ids),
+            )
+            pids = await self._family_prospect_ids(db, ids, domain)
+            cancelled = blocked = 0
+            if pids:
+                pm = ",".join("?" * len(pids))
+                cur = await db.execute(
+                    f"UPDATE outbox SET status = 'cancelled', error = ?, updated_at = ? "
+                    f"WHERE prospect_id IN ({pm}) AND status IN ('pending_review', 'approved')",
+                    (reason, now, *pids),
+                )
+                cancelled = cur.rowcount
+                cur = await db.execute(
+                    f"UPDATE prospects SET status = 'ineligible', status_reason = ?, "
+                    f"updated_at = ? WHERE id IN ({pm}) AND status IN ('new', 'queued')",
+                    (reason, now, *pids),
+                )
+                blocked = cur.rowcount
+            await db.commit()
+        await self.log_action(
+            action_type="company_disqualified", agent=source,
+            details={"company_id": company_id, "company": company[1],
+                     "company_ids": ids, "reason": reason,
+                     "cancelled_outbox": cancelled, "prospects_blocked": blocked,
+                     "prospects": len(pids)},
+        )
+        return {"found": True, "company_ids": ids, "reason": reason,
+                "cancelled_outbox": cancelled, "prospects_blocked": blocked,
+                "prospects": len(pids)}
+
+    async def requalify_company(self, company_id: str, note: str = "") -> dict:
+        """Deliberately re-enable a disqualified company.
+
+        Cancelled emails stay cancelled (a person decides what to send
+        again). Contacts parked because of the disqualification go back to
+        'new'; the usual eligibility checks then apply to them afresh.
+        """
+        now = _utcnow().isoformat()
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT id, name, disqualified_at, disqualified_reason "
+                "FROM companies WHERE id = ?", (company_id,)
+            ) as cursor:
+                company = await cursor.fetchone()
+            if not company:
+                return {"found": False, "changed": False}
+            if not company["disqualified_at"]:
+                return {"found": True, "changed": False}
+            ids, domain = await self._company_family(db, company_id)
+            marks = ",".join("?" * len(ids))
+            await db.execute(
+                f"UPDATE companies SET disqualified_at = NULL, disqualified_reason = '', "
+                f"disqualified_source = '', updated_at = ? WHERE id IN ({marks})",
+                (now, *ids),
+            )
+            pids = await self._family_prospect_ids(db, ids, domain)
+            released = 0
+            if pids:
+                pm = ",".join("?" * len(pids))
+                cur = await db.execute(
+                    f"UPDATE prospects SET status = 'new', status_reason = '', updated_at = ? "
+                    f"WHERE id IN ({pm}) AND status = 'ineligible' "
+                    f"AND status_reason LIKE '{qual.COMPANY_DISQUALIFIED}%'",
+                    (now, *pids),
+                )
+                released = cur.rowcount
+            await db.commit()
+        await self.log_action(
+            action_type="company_requalified", agent="owner",
+            details={"company_id": company_id, "company": company["name"],
+                     "company_ids": ids, "previous_reason": company["disqualified_reason"],
+                     "note": note, "prospects_released": released},
+        )
+        return {"found": True, "changed": True, "company_ids": ids,
+                "prospects_released": released}
+
+    async def list_disqualified_companies(self) -> list[dict]:
+        async with self._connect() as db:
+            return await self._disqualified_rows(db)
+
+    async def find_company(self, ref: str) -> dict | None:
+        """A company by id, or by domain / website / name (first exact match)."""
+        ref = (ref or "").strip()
+        if not ref:
+            return None
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT id, name, domain FROM companies WHERE id = ?", (ref,)
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row:
+                return dict(row)
+            key = qual.domain_of(ref)
+            async with db.execute(
+                "SELECT id, name, domain FROM companies "
+                "WHERE LOWER(domain) = ? OR LOWER(name) = ?", (key, ref.lower())
+            ) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+
+    async def apply_feedback_policy(
+        self, entity_type: str, entity_id: str, comment: str
+    ) -> dict | None:
+        """Explicit "no fit" feedback on a company or contact disqualifies the
+        whole company. Anything else is just a comment."""
+        if entity_type not in qual.NO_FIT_ENTITY_TYPES or not qual.is_no_fit(comment):
+            return None
+        company_id = entity_id if entity_type == "company" else ""
+        if entity_type != "company":
+            prospect = await self.get_prospect(entity_id)
+            if prospect is None:
+                return None
+            company_id = prospect.company_id
+            if not company_id:
+                match = await self.find_company(qual.domain_of(prospect.email))
+                company_id = match["id"] if match and qual.domain_of(prospect.email) \
+                    not in qual.SHARED_MAIL_DOMAINS else ""
+            if not company_id:
+                # No company record to mark: at least stop this contact.
+                reason = qual.disqualified_text(f"no fit: {comment.strip()[:120]}")
+                n = await self.cancel_pending_outbox_for_prospect(prospect.id, reason)
+                await self.set_prospect_ineligible(prospect.id, reason)
+                return {"found": False, "cancelled_outbox": n, "prospects_blocked": 1}
+        return await self.disqualify_company(
+            company_id, f"no fit: {comment.strip()[:120]}", source="feedback")
+
+    async def set_prospect_ineligible(self, prospect_id: str, reason: str) -> bool:
+        """Park a never-contacted prospect with a visible reason."""
+        async with self._connect() as db:
+            cur = await db.execute(
+                "UPDATE prospects SET status = 'ineligible', status_reason = ?, "
+                "updated_at = ? WHERE id = ? AND status IN ('new', 'queued')",
+                (reason, _utcnow().isoformat(), prospect_id),
+            )
+            await db.commit()
+            return cur.rowcount > 0
+
+    async def apply_eligibility_policy(self, allow_risky: bool) -> dict:
+        """Settle every never-contacted prospect before any draft is written.
+
+        - 'new' prospects at a disqualified company, or whose address the
+          sending policy blocks (invalid / unknown / guess / catch-all unless
+          send_to_risky), become 'ineligible' with the reason.
+        - 'queued' prospects whose first email the send gate refused over the
+          address status, with nothing live left, become 'ineligible' too
+          (no more silently queued records).
+        - 'ineligible' for an address reason go back to 'new' once the policy
+          or their status allows (a re-verified address, send_to_risky on).
+          Company disqualification is never released here.
+        """
+        counts = {"company_blocked": 0, "email_blocked": 0,
+                  "stuck_queued": 0, "released": 0}
+        now = _utcnow().isoformat()
+        async with self._connect() as db:
+            rows = await self._disqualified_rows(db)
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT p.id, p.company_id, p.email, p.email_status, p.status, "
+                "p.status_reason, COALESCE(c.domain, '') AS cdomain "
+                "FROM prospects p LEFT JOIN companies c ON c.id = p.company_id "
+                "WHERE p.status IN ('new', 'ineligible')"
+            ) as cursor:
+                candidates = [dict(r) for r in await cursor.fetchall()]
+            for p in candidates:
+                company_hit = self._match_disqualified(
+                    rows, p["company_id"] or "", self._domain_keys(p["email"], p["cdomain"]))
+                email_reason = qual.email_block_reason(
+                    p["email"], p["email_status"], allow_risky)
+                if p["status"] == "new":
+                    reason = (qual.disqualified_text(company_hit["disqualified_reason"])
+                              if company_hit else email_reason)
+                    if reason:
+                        await db.execute(
+                            "UPDATE prospects SET status = 'ineligible', status_reason = ?, "
+                            "updated_at = ? WHERE id = ?", (reason, now, p["id"]))
+                        counts["company_blocked" if company_hit else "email_blocked"] += 1
+                elif (p["status_reason"] or "").startswith(qual.EMAIL_BLOCKED) \
+                        and not company_hit and not email_reason:
+                    await db.execute(
+                        "UPDATE prospects SET status = 'new', status_reason = '', "
+                        "updated_at = ? WHERE id = ?", (now, p["id"]))
+                    counts["released"] += 1
+            async with db.execute(
+                """SELECT p.id, p.email, p.email_status FROM prospects p
+                   WHERE p.status = 'queued'
+                     AND NOT EXISTS (SELECT 1 FROM outbox o WHERE o.prospect_id = p.id
+                                     AND o.status IN ('pending_review', 'approved',
+                                                      'sending', 'sent'))
+                     AND EXISTS (SELECT 1 FROM outbox o WHERE o.prospect_id = p.id
+                                 AND o.status = 'failed' AND o.kind = 'sequence'
+                                 AND o.error LIKE 'gate:%email_status%')"""
+            ) as cursor:
+                stuck = [dict(r) for r in await cursor.fetchall()]
+            for p in stuck:
+                reason = qual.email_block_reason(p["email"], p["email_status"], allow_risky)
+                if reason:
+                    await db.execute(
+                        "UPDATE prospects SET status = 'ineligible', status_reason = ?, "
+                        "updated_at = ? WHERE id = ?", (reason, now, p["id"]))
+                    counts["stuck_queued"] += 1
+            await db.commit()
+        return counts
 
     # ── Email pattern cache (per-domain) ──
 
@@ -1539,6 +1876,7 @@ class StateManager:
                    FROM companies c
                    LEFT JOIN prospects p ON p.company_id = c.id
                    WHERE c.domain != ''
+                     AND c.disqualified_at IS NULL
                      AND (c.prospects_checked_at IS NULL
                           OR c.prospects_checked_at < datetime('now', ?))
                    GROUP BY c.id
@@ -1732,9 +2070,10 @@ class StateManager:
         async with self._connect() as db:
             async with db.execute(
                 f"""SELECT COUNT(*) FROM prospects
-                    WHERE status = 'new'
-                      AND NOT (COALESCE(email, '') != ''
-                               AND COALESCE(email_status, '') IN ({marks}))
+                    WHERE (status = 'ineligible'
+                           OR (status = 'new'
+                               AND NOT (COALESCE(email, '') != ''
+                                        AND COALESCE(email_status, '') IN ({marks}))))
                       AND datetime(created_at) >= datetime(?)""",
                 (*WRITABLE_EMAIL_STATUSES, since),
             ) as cursor:
@@ -1761,6 +2100,7 @@ class StateManager:
                 (feedback_id, entity_type, entity_id, comment),
             )
             await db.commit()
+        await self.apply_feedback_policy(entity_type, entity_id, comment)
         return feedback_id
 
     async def get_feedback(

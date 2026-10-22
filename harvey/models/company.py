@@ -27,6 +27,11 @@ class Company(BaseModel):
     # best prospects for anyone selling one.
     external_id: str = ""
     notes: str = ""
+    # Set by a person (or a "no fit" comment): Harvey never writes to or sends
+    # to anyone at a disqualified company until a deliberate requalify.
+    disqualified_at: datetime | None = None
+    disqualified_reason: str = ""
+    disqualified_source: str = ""   # feedback | manual | cli
     # Buying signals: detected tools on their site, and timely triggers
     # (hiring, funding, ...) as [{"type": ..., "detail": ..., "found_at": ...}]
     tech_stack: list[str] = Field(default_factory=list)

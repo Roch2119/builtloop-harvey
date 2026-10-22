@@ -491,7 +491,21 @@ async def add_feedback(request: Request):
     except Exception as e:
         logger.warning("Failed to save feedback: %s", e)
         return {"success": False, "message": "Could not save feedback."}
-    return {"success": True, "id": feedback_id}
+    # Explicit "no fit" on a company or contact disqualifies the whole company.
+    result = None
+    try:
+        from harvey.state import StateManager
+        result = await StateManager(db_path=str(DB_PATH)).apply_feedback_policy(
+            entity_type, entity_id, comment)
+    except Exception as e:
+        logger.warning("Saved feedback but could not apply the no-fit policy: %s", e)
+        return {"success": True, "id": feedback_id,
+                "message": "Saved, but the company could not be disqualified. "
+                           "Run `harvey company disqualify` to do it."}
+    out = {"success": True, "id": feedback_id}
+    if result:
+        out["disqualified"] = result
+    return out
 
 
 @app.get("/api/feedback/{entity_type}/{entity_id}")

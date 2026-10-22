@@ -31,7 +31,9 @@ class Prospect(BaseModel):
     department: str = ""
     source: str = ""           # how we found them
     source_url: str = ""       # where we found the info
-    status: str = "new"        # new/contacted/replied/meeting/closed/lost
+    status: str = "new"        # new/contacted/replied/meeting/closed/lost/ineligible
+    # Why a prospect is 'ineligible' (blocked email status, disqualified company).
+    status_reason: str = ""
     score: int = 0
     personalization_notes: str = ""
     # legacy fields kept for backwards compat with existing code

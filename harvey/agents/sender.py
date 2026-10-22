@@ -16,6 +16,7 @@ import random
 import re
 from datetime import date, datetime, timedelta, timezone
 
+from harvey import qualification as qual
 from harvey.brain import Brain
 from harvey.config import (
     HarveyConfig, EnvConfig, cold_daily_cap, compliance_footer_lines, compliance_notice,
@@ -219,6 +220,8 @@ class Sender:
                 continue
             if await self.state.get_setting(MANUAL_SEND_KEY + prospect.id):
                 continue  # the user emailed them by hand
+            if await self.state.get_disqualification_for_prospect(prospect):
+                continue  # the whole company was marked not a fit
             # Deliverability gate: never send to unverified/guessed addresses —
             # bounces are the fastest way to torch a sending domain.
             if (prospect.email_status or "guess") not in sendable_email:
@@ -409,6 +412,8 @@ class Sender:
                 continue
             if prospect.status not in SENDABLE_STATUSES:
                 continue
+            if await self.state.get_disqualification_for_prospect(prospect):
+                continue
             if (prospect.email_status or "guess") not in sendable_email:
                 skipped += 1
                 continue
@@ -513,6 +518,15 @@ class Sender:
         """Why this email must not go out, as (status, error), or None."""
         if prospect is None:
             return "failed", "prospect missing"
+        # A disqualified company is never emailed, whatever was approved
+        # earlier: matched on the contact's company, on any duplicate record
+        # of the same site, and on the address this item is going to.
+        disqualified = await self.state.disqualification_for(
+            company_id=prospect.company_id or "",
+            email=item.get("to_email") or prospect.email or "")
+        if disqualified:
+            return "cancelled", qual.disqualified_text(
+                disqualified["disqualified_reason"])[:300]
         if item["kind"] == "sequence":
             # Stop-on-reply / opt-out: never continue a sequence after contact.
             if prospect.status in STOP_STATUSES:
