@@ -452,7 +452,107 @@ async def get_company_contacts(company_id: str):
     return rows
 
 
+# ── Qualification ──
+# A person approves a company before Harvey may search for contacts, draft or
+# send. These routes show what Harvey observed (with URLs and quotes) and let
+# the owner approve or hold it. They never send anything.
+
+
+def _qualification_enforced() -> bool:
+    try:
+        from harvey.config import load_config
+        from harvey import qualification as qual
+        return qual.enforced(load_config())
+    except Exception:
+        return False
+
+
+@app.get("/api/qualification")
+async def get_qualification():
+    """Every assessed or disqualified company with its evidence."""
+    try:
+        state = _state()
+        await state.init_db()
+        rows = await query_db(
+            "SELECT id, name, domain, industry, location, disqualified_at, disqualified_reason, "
+            "COALESCE(qualification_state, 'unassessed') AS qstate, qualification_decided_by "
+            "FROM companies WHERE disqualified_at IS NOT NULL OR id IN "
+            "(SELECT DISTINCT company_id FROM qualification_assessments)")
+        companies = []
+        for r in rows:
+            latest = await state.latest_assessments(r["id"])
+            fit = latest.get("offer_fit") or {}
+            ident = latest.get("identity") or {}
+            contact = latest.get("contact") or {}
+            owner = latest.get("owner_decision") or {}
+            ev = fit.get("evidence") or {}
+            gate = "disqualified" if r["disqualified_at"] else r["qstate"]
+            companies.append({
+                "id": r["id"], "name": r["name"], "domain": r["domain"], "industry": r["industry"],
+                "location": r["location"], "state": gate, "decided_by": r["qualification_decided_by"],
+                "disqualified_reason": r["disqualified_reason"] or "",
+                "identity": {"decision": ident.get("decision", ""), "reason": ident.get("reason", "")},
+                "offer_fit": {"decision": fit.get("decision", ""), "reason": fit.get("reason", ""),
+                              "offer": (ev.get("offer") or "")},
+                "contact": {"decision": contact.get("decision", ""), "reason": contact.get("reason", "")},
+                "facts": ev.get("candidate_facts", []),
+                "inferred": ev.get("inferred_consequences", []),
+                "uncertainty": (fit.get("uncertainty") or []) + (ident.get("uncertainty") or []),
+                "approved_fact_ids": (owner.get("evidence") or {}).get("approved_fact_ids", []),
+                "assessed_at": fit.get("observed_at") or fit.get("created_at") or "",
+            })
+        order = {"needs_review": 0, "qualified": 1, "unassessed": 2, "disqualified": 3}
+        companies.sort(key=lambda c: (order.get(c["state"], 9),
+                                      0 if c["offer_fit"]["decision"] == "pass" else 1, c["name"] or ""))
+        unassessed = (await query_db(
+            "SELECT COUNT(*) AS n FROM companies WHERE disqualified_at IS NULL AND id NOT IN "
+            "(SELECT DISTINCT company_id FROM qualification_assessments)") or [{"n": 0}])[0]["n"]
+        counts: dict[str, int] = {}
+        for c in companies:
+            counts[c["state"]] = counts.get(c["state"], 0) + 1
+        return {"enforced": _qualification_enforced(), "counts": counts,
+                "not_yet_assessed": unassessed, "companies": companies}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/qualification/{company_id}/approve")
+async def qualification_approve(company_id: str, request: Request):
+    """The owner approves a company, and which quote-backed facts the writer may use."""
+    try:
+        body = {}
+        try:
+            body = await request.json()
+        except Exception:
+            pass
+        state = _state()
+        await state.init_db()
+        res = await state.approve_qualification(
+            company_id, note=str(body.get("note") or ""), fact_ids=body.get("fact_ids"))
+        return JSONResponse(res, status_code=200 if res.get("ok") else 400)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@app.post("/api/qualification/{company_id}/hold")
+async def qualification_hold(company_id: str, request: Request):
+    """Withdraw an approval or mark 'not enough reason to approach, skip for now'."""
+    try:
+        body = {}
+        try:
+            body = await request.json()
+        except Exception:
+            pass
+        state = _state()
+        await state.init_db()
+        ok = await state.hold_qualification(company_id, note=str(body.get("note") or "skipped by owner"))
+        return JSONResponse({"ok": bool(ok)}, status_code=200 if ok else 404)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
 # ── Feedback ──
+
 
 
 @app.post("/api/feedback")
@@ -1639,6 +1739,9 @@ async def get_live_status():
         next_up = f"Review the {awaiting_review} draft(s) waiting in the Outbox."
     elif by_hand:
         next_up = f"Open Campaigns and send the {len(by_hand)} unsent email(s)."
+    elif profiled > checked and _qualification_enforced():
+        next_up = (f"{profiled - checked} businesses are waiting for your approval in the Qualify tab. "
+                   "Harvey only searches for emails at companies you approve.")
     elif profiled > checked:
         next_up = f"Find emails for the {profiled - checked} businesses not checked yet."
     elif deliverable - drafted:

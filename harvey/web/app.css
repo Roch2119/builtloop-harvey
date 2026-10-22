@@ -603,3 +603,19 @@ details[open] summary::before { content: '– '; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .001ms !important; transition-duration: .001ms !important; }
 }
+
+/* Qualify */
+.q-banner{padding:12px 14px;border-left:3px solid var(--accent, #c8a24a);margin-bottom:14px}
+.q-counts{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
+.q-card{border:1px solid var(--border, #2a2a2a);border-radius:8px;padding:14px;margin-bottom:12px}
+.q-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}
+.q-name{font-weight:600;font-size:15px}
+.q-dims{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin:12px 0}
+.q-dim{font-size:11px;text-transform:uppercase;letter-spacing:.05em;opacity:.7;margin:8px 0 4px}
+.q-reason{font-size:13px;margin-top:4px;opacity:.9}
+.q-badge{display:inline-block;font-size:11px;padding:2px 8px;border-radius:10px;border:1px solid currentColor}
+.q-good{color:#4caf7a}.q-warn{color:#d9a441}.q-bad{color:#d9625a}.q-muted{opacity:.75}
+.q-facts{margin:8px 0 8px 18px;padding:0;font-size:13px}
+.q-facts li{margin-bottom:8px}
+.q-quote{opacity:.8;font-style:italic;margin-top:2px}
+.q-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:12px}

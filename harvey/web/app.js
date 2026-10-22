@@ -252,6 +252,7 @@ function loadCurrentTab() {
     case 'today': loadLiveStatus(); loadToday(); loadSetupStatus(); loadRuns(); loadTodayActivity(); break;
     case 'signals': loadSignals(); break;
     case 'discover': loadDiscoverProviders(); break;
+    case 'qualify': loadQualify(); break;
     case 'companies': if (!companyDrill) loadCompanies(); break;
     case 'prospects': loadProspects(); break;
     case 'campaigns': loadCampaigns(); break;
@@ -1882,3 +1883,108 @@ setInterval(() => {
     case 'controls': loadLogs(); break;
   }
 }, 15000);
+
+
+// ── Qualify: approve a company from its own evidence ──
+
+const QSTATE = {needs_review: 'Needs review', qualified: 'Approved', unassessed: 'Not assessed', disqualified: 'Disqualified'};
+const QDEC = {pass: 'Pass', review: 'Review', fail: 'Fail'};
+let _qualify = null;
+
+function qBadge(text, tone) {
+  return '<span class="q-badge q-' + tone + '">' + escHtml(text) + '</span>';
+}
+
+function qFact(f, checked) {
+  const url = safeHref(f.url);
+  const src = url ? ' <a href="' + url + '" target="_blank" rel="noopener noreferrer">source</a>' : '';
+  const box = f.writer_usable
+    ? '<input type="checkbox" class="q-fact" value="' + escHtml(f.id) + '"' + (checked ? ' checked' : '') + '> '
+    : '';
+  const quote = f.quote ? '<div class="q-quote">&ldquo;' + escHtml(f.quote) + '&rdquo;</div>' : '';
+  return '<li>' + box + '<b>' + escHtml((f.type || '').replace(/_/g, ' ')) + '</b>: ' + escHtml(f.text || '') + src + quote + '</li>';
+}
+
+function qCard(c) {
+  const tone = {qualified: 'good', needs_review: 'warn', disqualified: 'bad'}[c.state] || 'muted';
+  const approved = new Set(c.approved_fact_ids || []);
+  const facts = (c.facts || []).filter(f => f.polarity !== 'not_detected');
+  const usable = facts.filter(f => f.writer_usable);
+  let h = '<div class="q-card" id="q-' + escHtml(c.id) + '"><div class="q-head"><div>' +
+    '<div class="q-name">' + escHtml(c.name) + ' <span class="muted">' + escHtml(c.domain || '') + '</span></div>' +
+    '<div class="muted">' + escHtml([c.industry, c.location].filter(Boolean).join(' · ')) + '</div></div><div>' +
+    qBadge(QSTATE[c.state] || c.state, tone) + '</div></div>';
+  h += '<div class="q-dims">' +
+    ['identity', 'offer_fit', 'contact'].map(k => {
+      const d = c[k] || {};
+      return '<div><div class="q-dim">' + {identity: 'Identity', offer_fit: 'Offer fit', contact: 'Contact'}[k] + '</div>' +
+        qBadge(QDEC[d.decision] || d.decision || 'n/a', d.decision === 'pass' ? 'good' : d.decision === 'fail' ? 'bad' : 'warn') +
+        '<div class="q-reason">' + escHtml(d.reason || '') + '</div></div>';
+    }).join('') + '</div>';
+  if (c.state === 'disqualified') {
+    h += '<p class="muted">' + escHtml(c.disqualified_reason || 'Disqualified.') + '</p>';
+  } else {
+    h += '<details><summary>Evidence (' + facts.length + ' fact' + (facts.length === 1 ? '' : 's') + ')</summary><ul class="q-facts">' +
+      (facts.map(f => qFact(f, c.state === 'qualified' ? approved.has(f.id) : true)).join('') || '<li class="muted">None recorded.</li>') +
+      '</ul>';
+    if ((c.inferred || []).length) {
+      h += '<div class="q-dim">Inferred, not observed (a hypothesis)</div><ul class="q-facts">' +
+        c.inferred.map(i => '<li>' + escHtml(i.inference || '') + '</li>').join('') + '</ul>';
+    }
+    if ((c.uncertainty || []).length) {
+      h += '<div class="q-dim">What Harvey could not check</div><ul class="q-facts">' +
+        c.uncertainty.map(u => '<li>' + escHtml(u.text || u.type || '') + '</li>').join('') + '</ul>';
+    }
+    h += '</details>';
+    h += '<div class="q-actions">';
+    if (c.state === 'qualified') {
+      h += '<button class="btn btn-secondary btn-sm" onclick="qualifyHold(\'' + escHtml(c.id) + '\')">Withdraw approval</button>';
+    } else {
+      h += '<button class="btn btn-primary btn-sm" onclick="qualifyApprove(\'' + escHtml(c.id) + '\')">Approve for outreach</button>' +
+        '<button class="btn btn-secondary btn-sm" onclick="qualifyHold(\'' + escHtml(c.id) + '\')">Skip for now</button>' +
+        '<span class="muted">' + usable.length + ' quoted fact(s) the writer may use; untick any you do not want used.</span>';
+    }
+    h += '</div>';
+  }
+  return h + '</div>';
+}
+
+async function loadQualify() {
+  const el = document.getElementById('qualify-body');
+  const data = await api('/api/qualification');
+  if (!data || data.error) { el.innerHTML = offlineState(); return; }
+  _qualify = data;
+  const pending = (data.counts || {}).needs_review || 0;
+  navCount('nav-qualify', pending);
+  let h = '<div class="q-banner">' + (data.enforced
+    ? 'Qualification is <b>on</b>: Harvey only searches for contacts, drafts and sends for companies you approve here.'
+    : 'Qualification is <b>off</b>: Harvey is not requiring approval (set <code>qualification.enforce: true</code>).') +
+    ' ' + escHtml(String(data.not_yet_assessed || 0)) + ' compan(ies) have not been assessed yet; run <code>harvey qualify run</code> in your terminal.</div>';
+  const filter = ['needs_review', 'qualified', 'disqualified'];
+  h += '<div class="q-counts">' + filter.map(k => qBadge((QSTATE[k]) + ': ' + ((data.counts || {})[k] || 0), 'muted')).join(' ') + '</div>';
+  h += (data.companies || []).map(qCard).join('') ||
+    emptyState('&#10003;', 'Nothing assessed yet', 'Run <code>harvey qualify run</code> in your terminal to read companies\' own sites.');
+  el.innerHTML = h;
+}
+
+async function qualifyApprove(id) {
+  const card = document.getElementById('q-' + id);
+  const ids = card ? Array.from(card.querySelectorAll('.q-fact:checked')).map(b => b.value) : [];
+  let res = null;
+  try {
+    const r = await authFetch('/api/qualification/' + encodeURIComponent(id) + '/approve',
+      {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({fact_ids: ids})});
+    res = await r.json();
+  } catch { res = null; }
+  if (res && res.ok) showToast('Approved. Harvey may now search for contacts for this company.', 'success');
+  else showToast((res && res.error) || 'Could not approve.', 'error');
+  loadQualify();
+}
+
+async function qualifyHold(id) {
+  const res = await api('/api/qualification/' + encodeURIComponent(id) + '/hold',
+    {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({note: 'skipped or withdrawn by owner in the dashboard'})});
+  if (res && res.ok) showToast('Held for review.', 'success');
+  else showToast('Could not update.', 'error');
+  loadQualify();
+}
