@@ -386,6 +386,18 @@ _FIT_ORDER = ("dated_item", "call_to_book", "social_booking", "price_on_request"
 
 
 def assess_offer_fit(company: dict, pages: list[dict], identity: dict, today_year: int | None = None) -> dict:
+    """Offer-fit assessment. When pages could not be read and nothing strong was
+    found, the reason says the check is incomplete rather than "no reason found"."""
+    out = _assess_offer_fit(company, pages, identity, today_year)
+    unread = [u for u in out.get("uncertainty", []) if u["type"] in ("fetch_failed", "access_challenge")]
+    if unread and out["decision"] == "review":
+        kinds = ", ".join(sorted({u["text"].split(" page ")[0] for u in unread}))
+        out["reason"] = (f"Incomplete: {len(unread)} page(s) could not be read ({kinds}), so this result may "
+                         "be missing evidence. " + out["reason"])
+    return out
+
+
+def _assess_offer_fit(company: dict, pages: list[dict], identity: dict, today_year: int | None = None) -> dict:
     """A specific reason an offer could help, or an honest 'not established'."""
     now = datetime.now(timezone.utc)
     year = today_year or now.year

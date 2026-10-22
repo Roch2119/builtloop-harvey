@@ -457,3 +457,34 @@ def test_quote_cleanup_rejects_menu_and_slogan_text_and_strips_leftovers():
     ok = "We offer microblading for natural looking brows in Manchester."
     i = ok.find("microblading")
     assert sq(ok, i, i + 12) == ok
+
+
+def test_a_timeout_is_retried_once_then_reported_as_incomplete():
+    import asyncio
+    calls = {"n": 0}
+
+    class Flaky:
+        async def get(self, url):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise httpx.ConnectTimeout("slow")
+            return httpx.Response(200, text="<html><title>Paws</title></html>", request=httpx.Request("GET", url))
+
+    async def go():
+        r = SiteReader(delay=0, client=Flaky())
+        return await r._get("https://pawsgroom.test/")
+    resp, err = asyncio.run(go())
+    assert resp is not None and err == "" and calls["n"] == 2
+
+    class Dead:
+        async def get(self, url):
+            raise httpx.ConnectTimeout("slow")
+
+    async def go2():
+        return await SiteReader(delay=0, client=Dead())._get("https://pawsgroom.test/")
+    resp, err = asyncio.run(go2())
+    assert resp is None and "after 1 retry" in err
+
+    bad = {"kind": "booking", "requested_url": "https://pawsgroom.test/shop/", "error": err, "http_status": 0}
+    fit = assess_with_pages = assess.assess_offer_fit({"name": "x"}, [bad], {"name": {"confirmed": "Paws"}}, 2026)
+    assert fit["decision"] == "review" and fit["reason"].startswith("Incomplete: 1 page(s)")

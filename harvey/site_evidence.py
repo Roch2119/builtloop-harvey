@@ -362,11 +362,20 @@ class SiteReader:
             await self._client.aclose()
 
     async def _get(self, url: str) -> tuple[httpx.Response | None, str]:
-        try:
-            resp = await self._client.get(url)
-        except (httpx.HTTPError, ValueError) as e:
-            return None, f"{type(e).__name__}: {str(e)[:120]}"
-        return resp, ""
+        # One retry for a timeout or a failed connection: a slow moment must not
+        # decide whether a business looks like it has a gap.
+        for attempt in (1, 2):
+            try:
+                resp = await self._client.get(url)
+            except (httpx.TimeoutException, httpx.ConnectError) as e:
+                if attempt == 1:
+                    await asyncio.sleep(max(self.delay, 0.0) * 2)
+                    continue
+                return None, f"{type(e).__name__}: {str(e)[:120]} (after 1 retry)"
+            except (httpx.HTTPError, ValueError) as e:
+                return None, f"{type(e).__name__}: {str(e)[:120]}"
+            return resp, ""
+        return None, "unreachable"
 
     async def read(self, domain: str) -> list[PageRecord]:
         """Homepage, then up to max_pages-1 relevant linked pages."""
