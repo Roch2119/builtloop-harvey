@@ -795,6 +795,17 @@ def _in(ids) -> str:
     return ",".join("?" for _ in ids)
 
 
+def _draft_evidence(item: dict) -> dict | None:
+    """Evidence the writer was given for this draft (None for generic mail)."""
+    raw = item.get("evidence_json") or ""
+    if not raw:
+        return {"generic": True} if int(item.get("step") or 1) > 1 else None
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return None
+
+
 async def _with_context(items: list[dict]) -> list[dict]:
     """Attach the campaign, company, contact and signals behind each draft."""
     if not items:
@@ -862,6 +873,8 @@ async def _with_context(items: list[dict]) -> list[dict]:
             "score": p.get("score"),
             "notes": p.get("personalization_notes", ""),
             "signals": signals.get(p.get("company_id"), {}),
+            "evidence": _draft_evidence(item),
+            "qualification_pending": str(item.get("error") or "").startswith("qualification_pending"),
         }
     return items
 

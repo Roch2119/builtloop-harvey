@@ -493,6 +493,24 @@ class WriterConfig(BaseModel):
     humanizer: bool = False
 
 
+class QualificationConfig(BaseModel):
+    """Who may be contacted at all (see harvey/assess.py)."""
+    # Off by default so an existing install behaves as before. When on, a
+    # company must be approved ('qualified') before contact search, drafting
+    # or a cold send.
+    enforce: bool = False
+    # False: a person approves every company. True: a company whose identity
+    # and offer fit both pass is qualified automatically.
+    auto_qualify: bool = False
+    max_pages: int = 5                  # homepage + up to 4 relevant linked pages
+    request_delay_seconds: float = 1.0
+    # Extra clear mismatches (exact domain or its subdomains), on top of the
+    # directory/marketplace/platform patterns discovery already uses.
+    excluded_domains: list[str] = []
+    niche_terms: dict[str, list[str]] = {}
+    city_aliases: dict[str, list[str]] = {}
+
+
 class HarveyConfig(BaseModel):
     persona: PersonaConfig
     product: ProductConfig
@@ -502,6 +520,7 @@ class HarveyConfig(BaseModel):
     brain: BrainConfig = BrainConfig()
     compliance: ComplianceConfig = ComplianceConfig()
     writer: WriterConfig = WriterConfig()
+    qualification: QualificationConfig = QualificationConfig()
 
 
 class EnvConfig(BaseModel):

@@ -35,6 +35,7 @@ from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 import httpx
 from bs4 import BeautifulSoup
 
+from harvey import qualification as qual
 from harvey.brain import Brain
 from harvey.config import HarveyConfig, EnvConfig
 from harvey.integrations.email_finder import find_email, verify_published_address
@@ -175,13 +176,20 @@ class Scout:
         # the mercy of Serper/Bing flakiness — cheapest, most reliable win
         # available before spending any queries.
         strategies.append(("known_companies", self._prospect_via_known_companies))
-        if self.config.channels.linkedin.enabled and self.env.linkedin_email:
+        if qual.enforced(self.config):
+            # Qualification is on: only companies a person approved get a
+            # contact search. The strategies below find companies and people
+            # in one pass, before anyone could approve the company, so they
+            # are off until qualification is switched off.
+            logger.info("Scout: qualification enforced; contact search limited to approved companies.")
+        elif self.config.channels.linkedin.enabled and self.env.linkedin_email:
             strategies.append(("linkedin", self._prospect_via_linkedin))
         # Job boards first: hiring is the strongest intent signal, and the
         # strategy self-skips when python-jobspy isn't installed.
-        strategies.append(("hiring_boards", self._prospect_via_hiring_boards))
-        strategies.append(("profile_search", self._prospect_via_profile_search))
-        strategies.append(("company_discovery", self._prospect_via_company_discovery))
+        if not qual.enforced(self.config):
+            strategies.append(("hiring_boards", self._prospect_via_hiring_boards))
+            strategies.append(("profile_search", self._prospect_via_profile_search))
+            strategies.append(("company_discovery", self._prospect_via_company_discovery))
 
         for name, strategy in strategies:
             try:
@@ -531,7 +539,8 @@ class Scout:
 
         batch_size = min(remaining, HUNTER_DOMAINS_PER_CYCLE)
         try:
-            companies = await self.state.companies_needing_prospects(limit=batch_size)
+            companies = await self.state.companies_needing_prospects(
+                limit=batch_size, qualified_only=qual.enforced(self.config))
         except Exception as e:
             logger.debug(f"companies_needing_prospects failed: {e}")
             return 0
@@ -618,7 +627,7 @@ class Scout:
 
         try:
             companies = await self.state.companies_needing_prospects(
-                limit=MAX_COMPANIES_PER_CYCLE
+                limit=MAX_COMPANIES_PER_CYCLE, qualified_only=qual.enforced(self.config)
             )
         except Exception as e:
             logger.debug(f"companies_needing_prospects failed: {e}")

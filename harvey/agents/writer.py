@@ -69,7 +69,8 @@ class Writer:
         # with a recorded reason instead of getting a draft the Sender's gate
         # would refuse.
         allow_risky = getattr(self.config.channels.email, "send_to_risky", False)
-        settled = await self.state.apply_eligibility_policy(allow_risky)
+        require_q = qual.enforced(self.config)
+        settled = await self.state.apply_eligibility_policy(allow_risky, require_qualified=require_q)
         if any(settled.values()):
             logger.info(f"Writer: eligibility check: {settled}")
 
@@ -86,6 +87,8 @@ class Writer:
             if qual.email_block_reason(p.email, p.email_status, allow_risky):
                 continue
             if await self.state.get_disqualification_for_prospect(p):
+                continue
+            if require_q and await self.state.company_gate_state(p.company_id) != "qualified":
                 continue
             prospects_with_email.append(p)
         if not prospects_with_email:
@@ -222,7 +225,8 @@ class Writer:
         )
 
         drafted = 0
-        for (prospect, _), draft in zip(pending, polished):
+        for (prospect, original), draft in zip(pending, polished):
+            evidence = original.get("evidence")
             item_id = await self.state.add_outbox_item(
                 prospect_id=prospect.id,
                 campaign_id=campaign_id,
@@ -233,6 +237,7 @@ class Writer:
                 send_at=now,
                 status=status,
                 provider=provider,
+                evidence_json=json.dumps(evidence) if evidence else "",
             )
             if item_id:
                 drafted += 1
@@ -262,6 +267,27 @@ class Writer:
             "this writing. They never override the STRICT EMAIL RULES or the FACTS rule:\n"
             + lines
         )
+
+    async def _approved_evidence(self, prospect) -> list[dict]:
+        """Facts a person approved for this company (none unless qualification
+        is enforced and the company is approved)."""
+        if not qual.enforced(self.config) or not prospect.company_id:
+            return []
+        try:
+            return await self.state.get_approved_evidence(prospect.company_id)
+        except Exception as e:
+            logger.warning(f"Writer: could not read approved evidence: {e}")
+            return []
+
+    async def _outreach_reason(self, prospect) -> str:
+        """The assessed, inferred reason an offer could help (labelled as inference)."""
+        try:
+            latest = await self.state.latest_assessments(prospect.company_id)
+        except Exception:
+            return ""
+        fit = (latest.get("offer_fit") or {}).get("evidence", {})
+        consequences = fit.get("inferred_consequences") or []
+        return "; ".join(c["inference"] for c in consequences[:2])
 
     async def _write_personal_email(self, prospect) -> dict | None:
         """One grounded draft for one person. Facts in, one email out."""
@@ -299,6 +325,23 @@ class Writer:
         if prospect.personalization_notes:
             facts.append(f"- Research notes: {prospect.personalization_notes}")
 
+        # Evidence a person approved for this company: quoted from the
+        # business's own pages, with where and when it was seen. The model
+        # may use only these, and must say which it used.
+        evidence = await self._approved_evidence(prospect)
+        for f in evidence:
+            facts.append(f"- [{f['id']}] {f['text']} (source {f['url']}, seen {str(f.get('observed_at'))[:10]})")
+        reason = await self._outreach_reason(prospect) if evidence else ""
+        evidence_rule = ""
+        if evidence:
+            evidence_rule = (
+                "\n- Facts carrying an [id] are quoted from their own website. You may refer to them, "
+                "only as stated, and list the ids you used in \"evidence_ids\". Never say that "
+                "anything is missing, absent, broken or outdated on their site.")
+            if reason:
+                facts.append(f"- Why this might matter to them (OUR inference, not a fact about them; "
+                             f"never state it as fact, at most ask about it): {reason}")
+
         prompt = self.brain.load_prompt(
             "writer",
             product_name=self.config.product.name,
@@ -314,6 +357,7 @@ class Writer:
             prompt += "\n\n" + self.skills
         prompt += await self._feedback_block([prospect.id])
 
+        ids_field = ', "evidence_ids": ["..."]' if evidence else ""
         prompt += f"""
 
 Write ONE cold email (the very first touch) to this specific person.
@@ -330,9 +374,9 @@ Requirements:
 - Write the actual text (no merge variables — you know their name/company).
 - Subject: lowercase, 2-5 words.
 - No postal address, unsubscribe or opt-out line: Harvey adds them when it sends.
-- Follow every STRICT EMAIL RULE above.
+- Follow every STRICT EMAIL RULE above.{evidence_rule}
 
-Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
+Return ONLY JSON: {{"subject": "...", "body": "..."{ids_field}}}"""
 
         result = await self.brain.think_json(
             prompt, session_id="harvey-writer",
@@ -344,7 +388,22 @@ Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
         body = str(result.get("body") or "").strip()
         if not subject or not body:
             return None
-        return {"subject": subject[:120], "body": body[:2000]}
+        draft = {"subject": subject[:120], "body": body[:2000]}
+        if evidence:
+            # The model says which facts it used; ids it was never given are
+            # dropped. This is a record for the reviewer, not a proof that
+            # the wording is faithful: a person reads the evidence beside
+            # the draft and decides.
+            given = {f["id"]: f for f in evidence}
+            cited = [i for i in (result.get("evidence_ids") or []) if i in given]
+            draft["evidence"] = {
+                "company_id": prospect.company_id,
+                "cited": [given[i] for i in dict.fromkeys(cited)],
+                "available_not_cited": [i for i in given if i not in cited],
+                "reason_for_outreach": reason,
+                "note": "Cited ids are what the model reports using; verify the wording against them.",
+            }
+        return draft
 
     async def _write_sequence(self, prospects: list) -> list[EmailStep]:
         """Ask the brain to write a 3-email sequence."""

@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import json
 import subprocess
 import sys
 import textwrap
@@ -491,6 +492,18 @@ def cmd_outbox(args):
             body_preview = (item["body"][:200] + "...") if len(item["body"]) > 200 else item["body"]
             for line in body_preview.splitlines():
                 print(f"    {line}")
+            if item.get("evidence_json"):
+                try:
+                    ev = json.loads(item["evidence_json"])
+                except ValueError:
+                    ev = {}
+                print("    Evidence the writer was given (verify the wording against it):")
+                for f in ev.get("cited", []):
+                    print(f"      [{f['id']}] {f['text']} <{f['url']}> seen {str(f.get('observed_at'))[:10]}")
+                if ev.get("reason_for_outreach"):
+                    print(f"      Inference, not fact: {ev['reason_for_outreach']}")
+            elif item.get("step", 1) and int(item.get("step") or 1) > 1:
+                print("    (generic follow-up from the shared sequence; no company evidence)")
         if pending:
             print("\n  Approve: harvey outbox --approve <id>   |   all: harvey outbox --approve-all")
             print("  Reject:  harvey outbox --reject <id>\n")
@@ -786,6 +799,95 @@ def cmd_sending(args):
     asyncio.run(_run())
 
 
+def cmd_qualify(args):
+    """Assess, review and approve companies before any outreach."""
+    from harvey.config import load_config
+    from harvey.state import StateManager
+
+    async def _run():
+        state = StateManager()
+        await state.init_db()
+        act = args.qualify_action
+        if act == "status":
+            rows = await state.list_qualification_overview()
+            counts: dict[str, int] = {}
+            for r in rows:
+                k = "disqualified" if r["disqualified_at"] else (r["qualification_state"] or "unassessed")
+                counts[k] = counts.get(k, 0) + 1
+            print("\n  Qualification: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())))
+            pilot = await state.get_setting("qualification_pilot_ids")
+            print(f"  Pilot list: {len(pilot.split(',')) if pilot else 0} compan(ies)\n")
+            return
+        if act == "pilot-set":
+            ids = []
+            for ref in args.companies:
+                c = await state.find_company(ref)
+                if not c:
+                    print(f"  No company matches '{ref}'"); return
+                ids.append(c["id"])
+            await state.set_setting("qualification_pilot_ids", ",".join(ids))
+            print(f"\n  Pilot list saved: {len(ids)} companies. Nothing was fetched.\n")
+            return
+        if act == "run":
+            from harvey import qualify_run
+            ids = []
+            if args.pilot:
+                ids = [i for i in (await state.get_setting("qualification_pilot_ids")).split(",") if i]
+            for ref in args.companies:
+                c = await state.find_company(ref)
+                if not c:
+                    print(f"  No company matches '{ref}'"); return
+                ids.append(c["id"])
+            if not ids:
+                print("\n  Name companies, or use --pilot. This never runs on everything.\n"); return
+            config = load_config()
+            print(f"\n  Reading {len(ids)} compan(ies)' own websites (HTTP only; no email, no search).")
+            for r in await qualify_run.run(state, config, ids):
+                if not r.get("ok"):
+                    print(f"  {r}"); continue
+                c = await state.get_company(r["company_id"])
+                print(f"  {c.name:<40} proposed: {r['proposed']:<13} state: {r['state']}")
+            print("\n  Review with: harvey qualify report\n")
+            return
+        if act == "report":
+            ids = [i for i in (await state.get_setting("qualification_pilot_ids")).split(",") if i] \
+                if args.pilot else []
+            for ref in args.companies:
+                c = await state.find_company(ref)
+                if c:
+                    ids.append(c["id"])
+            for row in await state.list_qualification_overview(ids or None):
+                a = await state.latest_assessments(row["id"])
+                if not a:
+                    continue
+                print(f"\n  {row['name']} ({row['domain']}) — {row['qualification_state']}  [{row['id']}]")
+                for dim in ("identity", "offer_fit", "contact"):
+                    d = a.get(dim)
+                    if d:
+                        print(f"    {dim:<10} {d['decision']}: {d['reason']}")
+                        for u in d["uncertainty"]:
+                            print(f"      ? {u.get('type', '')}: {u.get('text', '')}")
+                fit = a.get("offer_fit", {}).get("evidence", {})
+                for inf in fit.get("inferred_consequences", []):
+                    print(f"      inference (not fact): {inf.get('inference')}")
+                for f in fit.get("candidate_facts", []):
+                    print(f"      [{f['id']}] {f['text']}  <{f['url']}> {str(f['observed_at'])[:10]}")
+            print()
+            return
+        company = await state.find_company(args.companies[0]) if args.companies else None
+        if not company:
+            print("\n  Name one company (id, domain or exact name).\n"); return
+        if act == "approve":
+            r = await state.approve_qualification(
+                company["id"], note=args.note, fact_ids=args.facts.split(",") if args.facts else None)
+            print(f"\n  {r}\n")
+        elif act == "hold":
+            await state.hold_qualification(company["id"], note=args.note)
+            print(f"\n  {company['name']} is back in review. Nothing is deleted.\n")
+
+    asyncio.run(_run())
+
+
 def cmd_company(args):
     """Disqualify / requalify a company, or list the disqualified ones."""
     from harvey.state import StateManager
@@ -974,6 +1076,16 @@ def main():
                      help="Company id, domain or exact name")
     sub.add_argument("--reason", default="", help="Why (required to disqualify)")
     sub.set_defaults(func=cmd_company)
+
+    sub = subparsers.add_parser(
+        "qualify", help="Check businesses against their own websites before any outreach")
+    sub.add_argument("qualify_action",
+                     choices=["status", "pilot-set", "run", "report", "approve", "hold"])
+    sub.add_argument("companies", nargs="*", help="Company ids, domains or exact names")
+    sub.add_argument("--pilot", action="store_true", help="Use the saved pilot list")
+    sub.add_argument("--facts", default="", help="approve: comma-separated fact ids (default: all)")
+    sub.add_argument("--note", default="")
+    sub.set_defaults(func=cmd_qualify)
 
     sub = subparsers.add_parser(
         "warmup", help="Check if your sending domain is set up and warmed up for cold email")

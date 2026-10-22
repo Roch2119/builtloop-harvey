@@ -1357,6 +1357,30 @@ const CONTACT_SOURCES = {
 };
 
 // What the draft is built on, so every claim can be checked against it.
+function renderDeskEvidence(ctx) {
+  const ev = ctx.evidence;
+  let out = '';
+  if (ctx.qualification_pending) {
+    out += '<div class="muted" style="margin-top:8px"><b>Held:</b> company not approved for outreach. ' +
+      'Wording and history are unchanged; approving it later does not approve this email.</div>';
+  }
+  if (!ev) return out;
+  if (ev.generic) {
+    return out + '<div class="muted" style="margin-top:8px">Generic follow-up from the shared sequence; ' +
+      'no company evidence was given to the writer.</div>';
+  }
+  const facts = (ev.cited || []).map(f =>
+    '<li>[' + escHtml(f.id) + '] ' + escHtml(f.text) + ' &mdash; <a href="' + (safeHref(f.url) || '#') +
+    '" target="_blank" rel="noopener noreferrer">source</a>, seen ' +
+    escHtml(String(f.observed_at || '').slice(0, 10)) +
+    (f.quote ? '<br><i>&ldquo;' + escHtml(f.quote) + '&rdquo;</i>' : '') + '</li>').join('');
+  return out + '<div style="margin-top:8px"><b>Evidence the writer reports using</b> ' +
+    '<span class="muted">(read the wording against it; a check cannot prove every claim)</span>' +
+    '<ul>' + (facts || '<li class="muted">none cited</li>') + '</ul>' +
+    (ev.reason_for_outreach ? '<div><b>Inference, not a fact about them:</b> ' +
+      escHtml(ev.reason_for_outreach) + '</div>' : '') + '</div>';
+}
+
 function renderDeskContext(ctx) {
   if (!ctx) return '';
   const row = (k, v) => v ? '<div class="k">' + k + '</div><div class="v">' + v + '</div>' : '';
@@ -1382,6 +1406,7 @@ function renderDeskContext(ctx) {
     row('Campaign', ctx.campaign ? escHtml(ctx.campaign) +
       ' <span class="muted">(how they were found, not a fact about them)</span>' : '') +
     row('Writer notes', escHtml(ctx.notes)) +
+    renderDeskEvidence(ctx) +
   '</div>';
 }
 

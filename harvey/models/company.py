@@ -31,7 +31,11 @@ class Company(BaseModel):
     # to anyone at a disqualified company until a deliberate requalify.
     disqualified_at: datetime | None = None
     disqualified_reason: str = ""
-    disqualified_source: str = ""   # feedback | manual | cli
+    disqualified_source: str = ""   # feedback | manual | cli | qualification
+    # unassessed | needs_review | qualified (a person approved it; see harvey/assess.py)
+    qualification_state: str = "unassessed"
+    qualification_decided_by: str = ""
+    qualification_decided_at: datetime | None = None
     # Buying signals: detected tools on their site, and timely triggers
     # (hiring, funding, ...) as [{"type": ..., "detail": ..., "found_at": ...}]
     tech_stack: list[str] = Field(default_factory=list)

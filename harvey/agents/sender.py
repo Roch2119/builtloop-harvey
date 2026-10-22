@@ -222,6 +222,9 @@ class Sender:
                 continue  # the user emailed them by hand
             if await self.state.get_disqualification_for_prospect(prospect):
                 continue  # the whole company was marked not a fit
+            if qual.enforced(self.config) and \
+                    await self.state.company_gate_state(prospect.company_id or "") != "qualified":
+                continue  # company not approved yet
             # Deliverability gate: never send to unverified/guessed addresses —
             # bounces are the fastest way to torch a sending domain.
             if (prospect.email_status or "guess") not in sendable_email:
@@ -414,6 +417,9 @@ class Sender:
                 continue
             if await self.state.get_disqualification_for_prospect(prospect):
                 continue
+            if qual.enforced(self.config) and \
+                    await self.state.company_gate_state(prospect.company_id or "") != "qualified":
+                continue
             if (prospect.email_status or "guess") not in sendable_email:
                 skipped += 1
                 continue
@@ -527,6 +533,13 @@ class Sender:
         if disqualified:
             return "cancelled", qual.disqualified_text(
                 disqualified["disqualified_reason"])[:300]
+        # With qualification enforced, a cold email needs a company a person
+        # approved. Not approved (or approval withdrawn) => held for review,
+        # never sent and never silently dropped.
+        if item["kind"] == "sequence" and qual.enforced(self.config):
+            gate_state = await self.state.company_gate_state(prospect.company_id or "")
+            if gate_state != "qualified":
+                return "pending_review", qual.pending_reason(gate_state)[:300]
         if item["kind"] == "sequence":
             # Stop-on-reply / opt-out: never continue a sequence after contact.
             if prospect.status in STOP_STATUSES:

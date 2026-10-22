@@ -450,6 +450,52 @@ MIGRATIONS: list[str] = [
     -- Why a prospect is 'ineligible' (blocked email status, disqualified company).
     ALTER TABLE prospects ADD COLUMN status_reason TEXT DEFAULT '';
     """,
+    # ── v13: qualification (identity / offer fit / contact), with evidence ──
+    """
+    -- unassessed | needs_review | qualified. 'disqualified' is disqualified_at.
+    ALTER TABLE companies ADD COLUMN qualification_state TEXT DEFAULT 'unassessed';
+    ALTER TABLE companies ADD COLUMN qualification_decided_by TEXT DEFAULT '';
+    ALTER TABLE companies ADD COLUMN qualification_decided_at TIMESTAMP DEFAULT NULL;
+
+    -- What each page of a business's own site said (or why it could not be
+    -- read). One row per page per read; nothing is overwritten.
+    CREATE TABLE IF NOT EXISTS page_evidence (
+        id TEXT PRIMARY KEY,
+        company_id TEXT NOT NULL,
+        run_id TEXT DEFAULT '',
+        kind TEXT DEFAULT '',
+        requested_url TEXT DEFAULT '',
+        final_url TEXT DEFAULT '',
+        http_status INTEGER DEFAULT 0,
+        redirected_off_domain INTEGER DEFAULT 0,
+        needs_rendering INTEGER DEFAULT 0,
+        error TEXT DEFAULT '',
+        data_json TEXT DEFAULT '{}',
+        fetched_at TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_page_evidence_company ON page_evidence(company_id, fetched_at);
+
+    -- One decision per dimension (identity, offer_fit, contact, owner_decision)
+    -- with its reason, evidence and uncertainty. History is kept.
+    CREATE TABLE IF NOT EXISTS qualification_assessments (
+        id TEXT PRIMARY KEY,
+        company_id TEXT NOT NULL,
+        dimension TEXT NOT NULL,
+        decision TEXT DEFAULT '',
+        reason TEXT DEFAULT '',
+        evidence_json TEXT DEFAULT '{}',
+        uncertainty_json TEXT DEFAULT '[]',
+        observed_at TIMESTAMP,
+        assessed_by TEXT DEFAULT 'harvey',
+        run_id TEXT DEFAULT '',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_qual_company_dim
+        ON qualification_assessments(company_id, dimension, created_at);
+
+    -- The evidence behind a draft, shown beside it for review.
+    ALTER TABLE outbox ADD COLUMN evidence_json TEXT DEFAULT '';
+    """,
 ]
 
 BRAIN_PROVIDERS = ("claude", "codex")
@@ -1064,7 +1110,9 @@ class StateManager:
             await db.commit()
             return cur.rowcount > 0
 
-    async def apply_eligibility_policy(self, allow_risky: bool) -> dict:
+    async def apply_eligibility_policy(
+        self, allow_risky: bool, require_qualified: bool = False
+    ) -> dict:
         """Settle every never-contacted prospect before any draft is written.
 
         - 'new' prospects at a disqualified company, or whose address the
@@ -1077,7 +1125,7 @@ class StateManager:
           or their status allows (a re-verified address, send_to_risky on).
           Company disqualification is never released here.
         """
-        counts = {"company_blocked": 0, "email_blocked": 0,
+        counts = {"company_blocked": 0, "email_blocked": 0, "qualification_pending": 0,
                   "stuck_queued": 0, "released": 0}
         now = _utcnow().isoformat()
         async with self._connect() as db:
@@ -1085,7 +1133,9 @@ class StateManager:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 "SELECT p.id, p.company_id, p.email, p.email_status, p.status, "
-                "p.status_reason, COALESCE(c.domain, '') AS cdomain "
+                "p.status_reason, COALESCE(c.domain, '') AS cdomain, "
+                "CASE WHEN c.id IS NULL THEN 'no_company' "
+                "     ELSE COALESCE(c.qualification_state, 'unassessed') END AS cq "
                 "FROM prospects p LEFT JOIN companies c ON c.id = p.company_id "
                 "WHERE p.status IN ('new', 'ineligible')"
             ) as cursor:
@@ -1095,20 +1145,29 @@ class StateManager:
                     rows, p["company_id"] or "", self._domain_keys(p["email"], p["cdomain"]))
                 email_reason = qual.email_block_reason(
                     p["email"], p["email_status"], allow_risky)
+                pending = (qual.pending_reason(p["cq"])
+                           if require_qualified and p["cq"] != "qualified" else "")
                 if p["status"] == "new":
                     reason = (qual.disqualified_text(company_hit["disqualified_reason"])
-                              if company_hit else email_reason)
+                              if company_hit else (pending or email_reason))
                     if reason:
                         await db.execute(
                             "UPDATE prospects SET status = 'ineligible', status_reason = ?, "
                             "updated_at = ? WHERE id = ?", (reason, now, p["id"]))
-                        counts["company_blocked" if company_hit else "email_blocked"] += 1
-                elif (p["status_reason"] or "").startswith(qual.EMAIL_BLOCKED) \
-                        and not company_hit and not email_reason:
-                    await db.execute(
-                        "UPDATE prospects SET status = 'new', status_reason = '', "
-                        "updated_at = ? WHERE id = ?", (now, p["id"]))
-                    counts["released"] += 1
+                        counts["company_blocked" if company_hit
+                               else "qualification_pending" if pending
+                               else "email_blocked"] += 1
+                elif (p["status_reason"] or "").startswith((qual.EMAIL_BLOCKED, qual.QUALIFICATION_PENDING)) \
+                        and not company_hit and not pending:
+                    if not email_reason:
+                        await db.execute(
+                            "UPDATE prospects SET status = 'new', status_reason = '', "
+                            "updated_at = ? WHERE id = ?", (now, p["id"]))
+                        counts["released"] += 1
+                    elif email_reason != p["status_reason"]:
+                        await db.execute(
+                            "UPDATE prospects SET status_reason = ?, updated_at = ? WHERE id = ?",
+                            (email_reason, now, p["id"]))
             async with db.execute(
                 """SELECT p.id, p.email, p.email_status FROM prospects p
                    WHERE p.status = 'queued'
@@ -1129,6 +1188,226 @@ class StateManager:
                     counts["stuck_queued"] += 1
             await db.commit()
         return counts
+
+    # ── Qualification (identity / offer fit / contact; see harvey/assess.py) ──
+
+    async def save_page_evidence(self, company_id: str, run_id: str, pages: list[dict]) -> int:
+        """Store what each page said (or why it could not be read)."""
+        scalar = ("kind", "requested_url", "final_url", "http_status", "redirected_off_domain",
+                  "needs_rendering", "error", "fetched_at")
+        async with self._connect() as db:
+            for p in pages:
+                rest = {k: v for k, v in p.items() if k not in scalar}
+                await db.execute(
+                    """INSERT INTO page_evidence
+                       (id, company_id, run_id, kind, requested_url, final_url, http_status,
+                        redirected_off_domain, needs_rendering, error, data_json, fetched_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (_new_id(), company_id, run_id, p.get("kind", ""), p.get("requested_url", ""),
+                     p.get("final_url", ""), int(p.get("http_status") or 0),
+                     int(bool(p.get("redirected_off_domain"))), int(bool(p.get("needs_rendering"))),
+                     p.get("error", ""), json.dumps(rest), p.get("fetched_at", "")),
+                )
+            await db.commit()
+        return len(pages)
+
+    async def get_page_evidence(self, company_id: str, run_id: str | None = None) -> list[dict]:
+        """Pages from one read (default: the latest) as dicts."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            if run_id is None:
+                async with db.execute(
+                    "SELECT run_id FROM page_evidence WHERE company_id = ? "
+                    "ORDER BY fetched_at DESC, rowid DESC LIMIT 1", (company_id,)
+                ) as cursor:
+                    row = await cursor.fetchone()
+                run_id = row[0] if row else None
+            if run_id is None:
+                return []
+            async with db.execute(
+                "SELECT * FROM page_evidence WHERE company_id = ? AND run_id = ? ORDER BY rowid",
+                (company_id, run_id),
+            ) as cursor:
+                rows = [dict(r) for r in await cursor.fetchall()]
+        out = []
+        for r in rows:
+            data = json.loads(r.pop("data_json") or "{}")
+            r.pop("id", None)
+            r["redirected_off_domain"] = bool(r["redirected_off_domain"])
+            r["needs_rendering"] = bool(r["needs_rendering"])
+            out.append({**data, **r})
+        return out
+
+    async def save_assessment(self, company_id: str, run_id: str, dimension: str, result: dict,
+                              assessed_by: str = "harvey") -> str:
+        """One decision with its reason, evidence and uncertainty. History kept."""
+        decision = str(result.get("decision", ""))
+        reason = str(result.get("reason", ""))
+        uncertainty = result.get("uncertainty", [])
+        observed = str(result.get("observed_at", "") or _utcnow().isoformat(timespec="seconds"))
+        evidence = {k: v for k, v in result.items() if k not in ("decision", "reason", "uncertainty")}
+        item_id = _new_id()
+        async with self._connect() as db:
+            await db.execute(
+                """INSERT INTO qualification_assessments
+                   (id, company_id, dimension, decision, reason, evidence_json, uncertainty_json,
+                    observed_at, assessed_by, run_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (item_id, company_id, dimension, decision, reason, json.dumps(evidence),
+                 json.dumps(uncertainty), observed, assessed_by, run_id),
+            )
+            await db.commit()
+        return item_id
+
+    async def latest_assessments(self, company_id: str) -> dict[str, dict]:
+        """Newest row per dimension, parsed: {dimension: {decision, reason, evidence, ...}}."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM qualification_assessments WHERE company_id = ? "
+                "ORDER BY created_at, rowid", (company_id,)
+            ) as cursor:
+                rows = [dict(r) for r in await cursor.fetchall()]
+        out: dict[str, dict] = {}
+        for r in rows:
+            r["evidence"] = json.loads(r.pop("evidence_json") or "{}")
+            r["uncertainty"] = json.loads(r.pop("uncertainty_json") or "[]")
+            out[r["dimension"]] = r
+        return out
+
+    async def set_qualification_state(self, company_id: str, state_value: str, by: str) -> bool:
+        if state_value not in ("unassessed", "needs_review", "qualified"):
+            raise ValueError(f"unknown qualification state '{state_value}'")
+        now = _utcnow().isoformat()
+        async with self._connect() as db:
+            cur = await db.execute(
+                "UPDATE companies SET qualification_state = ?, qualification_decided_by = ?, "
+                "qualification_decided_at = ?, updated_at = ? WHERE id = ?",
+                (state_value, by, now, now, company_id),
+            )
+            await db.commit()
+            return cur.rowcount > 0
+
+    async def company_gate_state(self, company_id: str) -> str:
+        """'disqualified' | 'qualified' | 'needs_review' | 'unassessed' | 'no_company'."""
+        if not company_id:
+            return "no_company"
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT disqualified_at, COALESCE(qualification_state, 'unassessed') "
+                "FROM companies WHERE id = ?", (company_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+        if not row:
+            return "no_company"
+        return "disqualified" if row[0] else row[1]
+
+    async def record_assessment_outcome(self, company_id: str, run_id: str, identity: dict,
+                                        fit: dict, contact: dict, proposed: str,
+                                        auto_qualify: bool = False) -> str:
+        """Save the three decisions and settle the company's state.
+
+        Only a configured mismatch disqualifies by itself. A person's earlier
+        approval is never overturned by a re-assessment (it is recorded and
+        left for the person to revisit). Returns the resulting gate state.
+        """
+        await self.save_assessment(company_id, run_id, "identity", identity)
+        await self.save_assessment(company_id, run_id, "offer_fit", fit)
+        await self.save_assessment(company_id, run_id, "contact", contact)
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT qualification_state, qualification_decided_by FROM companies WHERE id = ?",
+                (company_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+        current, decided_by = (row[0], row[1]) if row else ("unassessed", "")
+        if proposed == "disqualified":
+            await self.disqualify_company(
+                company_id, identity.get("reason", "configured mismatch"), source="qualification")
+        elif current == "qualified" and decided_by == "owner":
+            pass
+        elif proposed == "qualified" and auto_qualify:
+            await self.set_qualification_state(company_id, "qualified", "auto")
+        else:
+            await self.set_qualification_state(company_id, "needs_review", "harvey")
+        return await self.company_gate_state(company_id)
+
+    async def approve_qualification(self, company_id: str, note: str = "",
+                                    fact_ids: list[str] | None = None) -> dict:
+        """A person approves a company for outreach, and which of its
+        quote-backed facts the writer may use (default: all of them).
+
+        Needs a completed assessment, so the approval is always of something
+        that was shown. Refuses a disqualified company (requalify it first).
+        """
+        gate = await self.company_gate_state(company_id)
+        if gate == "no_company":
+            return {"ok": False, "error": "no such company"}
+        if gate == "disqualified":
+            return {"ok": False, "error": "company is disqualified; requalify it first"}
+        latest = await self.latest_assessments(company_id)
+        if "identity" not in latest or "offer_fit" not in latest:
+            return {"ok": False, "error": "not assessed yet; run: harvey qualify run"}
+        candidates = latest["offer_fit"]["evidence"].get("candidate_facts", [])
+        wanted = set(fact_ids) if fact_ids is not None else {f["id"] for f in candidates}
+        unknown = wanted - {f["id"] for f in candidates}
+        if unknown:
+            return {"ok": False, "error": f"unknown fact id(s): {sorted(unknown)}"}
+        approved = [f for f in candidates if f["id"] in wanted and f.get("writer_usable")]
+        await self.save_assessment(
+            company_id, "", "owner_decision",
+            {"decision": "approved", "reason": note or "approved for outreach by owner",
+             "approved_fact_ids": [f["id"] for f in approved], "approved_facts": approved,
+             "identity_decision_at_approval": latest["identity"]["decision"],
+             "offer_fit_decision_at_approval": latest["offer_fit"]["decision"],
+             "uncertainty": latest["identity"]["uncertainty"]},
+            assessed_by="owner")
+        await self.set_qualification_state(company_id, "qualified", "owner")
+        prospects_released = await self._release_qualification_pending(company_id)
+        await self.log_action("company_qualified", "owner", {
+            "company_id": company_id, "note": note, "approved_fact_ids": [f["id"] for f in approved],
+            "prospects_released": prospects_released})
+        return {"ok": True, "approved_facts": len(approved), "prospects_released": prospects_released}
+
+    async def _release_qualification_pending(self, company_id: str) -> int:
+        """Contacts parked only because the company was not approved yet go
+        back to 'new' (the eligibility check still applies to them)."""
+        async with self._connect() as db:
+            cur = await db.execute(
+                "UPDATE prospects SET status = 'new', status_reason = '', updated_at = ? "
+                "WHERE company_id = ? AND status = 'ineligible' AND status_reason LIKE ?",
+                (_utcnow().isoformat(), company_id, f"{qual.QUALIFICATION_PENDING}%"),
+            )
+            await db.commit()
+            return cur.rowcount
+
+    async def hold_qualification(self, company_id: str, note: str = "") -> bool:
+        """Withdraw an approval: the company goes back to needs_review."""
+        ok = await self.set_qualification_state(company_id, "needs_review", "owner")
+        if ok:
+            await self.log_action("company_held_for_review", "owner",
+                                  {"company_id": company_id, "note": note})
+        return ok
+
+    async def get_approved_evidence(self, company_id: str) -> list[dict]:
+        """The facts a person approved the writer to use for this company."""
+        latest = await self.latest_assessments(company_id)
+        owner = latest.get("owner_decision")
+        if not owner or (await self.company_gate_state(company_id)) != "qualified":
+            return []
+        return list(owner["evidence"].get("approved_facts", []))
+
+    async def list_qualification_overview(self, company_ids: list[str] | None = None) -> list[dict]:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            sql = ("SELECT id, name, domain, industry, location, qualification_state, "
+                   "qualification_decided_by, disqualified_at FROM companies")
+            params: list = []
+            if company_ids:
+                sql += f" WHERE id IN ({','.join('?' * len(company_ids))})"
+                params = list(company_ids)
+            async with db.execute(sql, params) as cursor:
+                return [dict(r) for r in await cursor.fetchall()]
 
     # ── Email pattern cache (per-domain) ──
 
@@ -1202,6 +1481,7 @@ class StateManager:
         provider: str = "",
         thread_ref: str = "",
         in_reply_to: str = "",
+        evidence_json: str = "",
     ) -> str | None:
         """Queue one outgoing email. Returns its id, or None when the
         (campaign, prospect, step) slot already exists — the double-send guard."""
@@ -1211,12 +1491,13 @@ class StateManager:
                 """INSERT OR IGNORE INTO outbox
                    (id, campaign_id, prospect_id, conversation_id, step, kind,
                     to_email, subject, body, status, send_at, provider,
-                    thread_ref, in_reply_to)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    thread_ref, in_reply_to, evidence_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     item_id, campaign_id, prospect_id, conversation_id,
                     int(step), kind, _norm(to_email), subject, body,
                     status, send_at, provider, thread_ref, in_reply_to,
+                    evidence_json,
                 ),
             )
             await db.commit()
@@ -1854,7 +2135,7 @@ class StateManager:
             await db.commit()
 
     async def companies_needing_prospects(
-        self, limit: int = 10, stale_days: int = 14
+        self, limit: int = 10, stale_days: int = 14, qualified_only: bool = False
     ) -> list[dict]:
         """Companies with a domain, zero prospects, and no recent check.
 
@@ -1877,13 +2158,14 @@ class StateManager:
                    LEFT JOIN prospects p ON p.company_id = c.id
                    WHERE c.domain != ''
                      AND c.disqualified_at IS NULL
+                     AND (? = 0 OR c.qualification_state = 'qualified')
                      AND (c.prospects_checked_at IS NULL
                           OR c.prospects_checked_at < datetime('now', ?))
                    GROUP BY c.id
                    HAVING COUNT(p.id) = 0
                    ORDER BY c.prospects_checked_at IS NOT NULL, c.prospects_checked_at
                    LIMIT ?""",
-                (f"-{int(stale_days)} days", int(limit)),
+                (1 if qualified_only else 0, f"-{int(stale_days)} days", int(limit)),
             ) as cursor:
                 return [dict(r) for r in await cursor.fetchall()]
 

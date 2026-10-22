@@ -1,0 +1,303 @@
+"""Qualification pilot: evidence, three separate decisions, and the gates.
+
+Websites are canned (httpx MockTransport): nothing here touches the network,
+sends email or searches for contacts.
+"""
+
+import json
+import sqlite3
+from types import SimpleNamespace
+
+import httpx
+import pytest
+
+from harvey import assess, qualify_run
+from harvey import qualification as qual
+from harvey.agents.writer import Writer
+from harvey.config import QualificationConfig
+from harvey.models.company import Company
+from harvey.site_evidence import SiteReader
+from harvey.state import MIGRATIONS, StateManager
+from tests.test_disqualification import company, contact, writer_config
+from tests.test_outbox_native import FakeProvider, make_sender, seed_campaign, state  # noqa: F401
+from tests.test_writer_retry import GOOD, FakeBrain
+
+HOME = """<html><head><title>Northside Dog Grooming | Manchester</title>
+<meta name="viewport" content="width=device-width"></head><body>
+<h1>Northside Dog Grooming</h1>
+<p>Professional dog grooming and dog washing at 12 High Street, Manchester M1 1AA.
+Call us on 0161 555 0100 to book your dog in. We have groomed dogs across Manchester for ten years and
+love every breed that comes through our door, big or small, fluffy or short coated.</p>
+<a href="/about">About</a><a href="/contact">Contact</a><a href="/services">Services</a>
+</body></html>"""
+ABOUT = "<html><head><title>About</title></head><body><h1>About us</h1><p>Family run dog groomers in Manchester since 2014. " + "We care. " * 30 + "</p></body></html>"
+
+
+def site(handlers, default_status=404):
+    def handler(request: httpx.Request) -> httpx.Response:
+        h = handlers.get(str(request.url))
+        if h is None:
+            return httpx.Response(default_status, text="nope")
+        return h if isinstance(h, httpx.Response) else httpx.Response(200, text=h)
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler), follow_redirects=True)
+
+
+def cfg(**kw):
+    return SimpleNamespace(
+        qualification=QualificationConfig(enforce=True, request_delay_seconds=0, **kw),
+        channels=SimpleNamespace(email=SimpleNamespace(
+            provider="gmail", require_approval=True, send_to_risky=False)),
+        product=SimpleNamespace(name="P", description="D", key_benefits=[], pricing=""),
+        persona=SimpleNamespace(name="S", company="C", role="R", tone="t"),
+    )
+
+
+async def grooming(state, domain="northsidegrooming.test"):
+    return await state.add_company(Company(
+        name="Dog Groomers Manchester", domain=domain, industry="dog groomer", location="Manchester"))
+
+
+async def assess_with(state, config, cid, handlers, domain="northsidegrooming.test"):
+    reader = SiteReader(5, 0, client=site(handlers))
+    return await qualify_run.assess_company(state, config, cid, reader=reader)
+
+
+GOOD_SITE = {f"https://northsidegrooming.test": HOME,
+             "https://northsidegrooming.test/about": ABOUT,
+             "https://northsidegrooming.test/contact": ABOUT,
+             "https://northsidegrooming.test/services": ABOUT}
+
+
+# ── evidence, uncertainty ──
+
+@pytest.mark.asyncio
+async def test_confirmed_identity_is_kept_apart_from_the_query(state):
+    cid = await grooming(state)
+    r = await assess_with(state, cfg(), cid, GOOD_SITE)
+    ident = r["identity"]
+    assert ident["query_derived"]["name"] == "Dog Groomers Manchester"      # from the search
+    assert ident["name"]["confirmed"] == "Northside Dog Grooming"            # from the site
+    assert ident["decision"] == "pass"
+    assert all(f["url"].startswith("https://northsidegrooming.test") for f in r["offer_fit"]["candidate_facts"])
+    assert all(f["quote"] and f["observed_at"] for f in r["offer_fit"]["candidate_facts"])
+    assert await state.get_page_evidence(cid)                                 # pages stored
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("handlers", [
+    {},                                                                       # nothing loads
+    {"https://northsidegrooming.test": httpx.Response(
+        302, headers={"location": "https://elsewhere.test/"}),
+     "https://elsewhere.test/": HOME},                                        # redirected away
+    {"https://northsidegrooming.test": "<html><body><div id=app></div><script src=a.js></script></body></html>"},
+])
+async def test_failed_redirected_or_unrendered_sites_go_to_review_not_out(state, handlers):
+    cid = await grooming(state)
+    r = await assess_with(state, cfg(), cid, handlers)
+    assert r["proposed"] == "needs_review"
+    assert r["state"] == "needs_review"
+    assert (await state.get_company(cid)).disqualified_at is None
+    assert r["identity"]["uncertainty"] or r["identity"]["decision"] != "pass"
+
+
+@pytest.mark.asyncio
+async def test_an_undetected_feature_is_never_a_claim_or_a_pass(state):
+    cid = await grooming(state)
+    r = await assess_with(state, cfg(), cid, GOOD_SITE)
+    fit = r["offer_fit"]
+    assert not [f for f in fit["candidate_facts"] if f.get("polarity") == "not_detected"]
+    assert not [f for f in fit["candidate_facts"] if "booking" in f["text"].lower() and "no " in f["text"].lower()]
+    # Only not-detected facts => review, never a pass or a writer fact.
+    only_nd = assess.assess_offer_fit({"name": "x"}, [], r["identity"])
+    assert only_nd["decision"] != "pass"
+
+
+@pytest.mark.asyncio
+async def test_only_a_configured_mismatch_excludes_automatically(state):
+    directory = await state.add_company(Company(name="Whatclinic", domain="whatclinic.com", industry="clinic"))
+    r = await assess_with(state, cfg(), directory, {}, domain="whatclinic.com")
+    assert r["proposed"] == "disqualified"
+    assert (await state.get_company(directory)).disqualified_at is not None
+
+    # Franchise / nonprofit / agency-built wording is not a reason to exclude.
+    html = HOME.replace("</body>", "<footer>Franchise location. Website by Acme Web Agency. Registered charity.</footer></body>")
+    cid = await grooming(state)
+    r2 = await assess_with(state, cfg(), cid, {**GOOD_SITE, "https://northsidegrooming.test": html})
+    assert r2["proposed"] != "disqualified"
+    assert (await state.get_company(cid)).disqualified_at is None
+
+
+@pytest.mark.asyncio
+async def test_excluded_domains_come_from_config(state):
+    cid = await grooming(state, "listings.test")
+    r = await assess_with(state, cfg(excluded_domains=["listings.test"]), cid, {}, domain="listings.test")
+    assert r["proposed"] == "disqualified"
+
+
+# ── states and owner approval ──
+
+@pytest.mark.asyncio
+async def test_harvey_proposes_but_only_a_person_qualifies(state):
+    cid = await grooming(state)
+    r = await assess_with(state, cfg(), cid, GOOD_SITE)
+    assert r["proposed"] == "qualified"
+    assert await state.company_gate_state(cid) == "needs_review"
+    res = await state.approve_qualification(cid, note="looks right")
+    assert res["ok"] and await state.company_gate_state(cid) == "qualified"
+    assert await state.get_approved_evidence(cid)
+
+
+@pytest.mark.asyncio
+async def test_approval_needs_an_assessment_and_a_rerun_does_not_overturn_it(state):
+    cid = await grooming(state)
+    assert not (await state.approve_qualification(cid))["ok"]
+    await assess_with(state, cfg(), cid, GOOD_SITE)
+    await state.approve_qualification(cid)
+    await assess_with(state, cfg(), cid, {})                 # site now unreachable
+    assert await state.company_gate_state(cid) == "qualified"
+    await state.hold_qualification(cid)
+    assert await state.company_gate_state(cid) == "needs_review"
+    assert await state.get_approved_evidence(cid) == []
+
+
+@pytest.mark.asyncio
+async def test_approval_cannot_reopen_a_disqualified_company(state):
+    cid = await grooming(state)
+    await assess_with(state, cfg(), cid, GOOD_SITE)
+    await state.disqualify_company(cid, "not a fit", source="cli")
+    assert not (await state.approve_qualification(cid))["ok"]
+
+
+# ── the gates ──
+
+@pytest.mark.asyncio
+async def test_unqualified_companies_get_no_contact_search_and_no_draft(state):
+    cid = await grooming(state)
+    pid = await contact(state, cid, "info@northsidegrooming.test")
+    assert await state.companies_needing_prospects(qualified_only=True) == []
+    brain = FakeBrain(reply=GOOD)
+    await Writer(brain, state, cfg(), None).run()
+    assert brain.calls == 0
+    p = await state.get_prospect(pid)
+    assert p.status == "ineligible" and p.status_reason.startswith(qual.QUALIFICATION_PENDING)
+
+
+@pytest.mark.asyncio
+async def test_approval_releases_the_parked_contact_and_it_can_progress(state):
+    cid = await grooming(state)
+    pid = await contact(state, cid, "info@northsidegrooming.test")
+    await Writer(FakeBrain(reply=GOOD), state, cfg(), None).run()
+    assert (await state.get_prospect(pid)).status == "ineligible"
+    await assess_with(state, cfg(), cid, GOOD_SITE)
+    await state.approve_qualification(cid)
+    assert (await state.get_prospect(pid)).status == "new"
+    brain = FakeBrain(reply=GOOD)
+    await Writer(brain, state, cfg(), None).run()
+    assert (await state.get_prospect(pid)).status != "ineligible"
+
+
+@pytest.mark.asyncio
+async def test_final_send_check_holds_cold_email_to_an_unqualified_company(state):
+    cid = await grooming(state)
+    pid = await contact(state, cid, "info@northsidegrooming.test")
+    camp = await seed_campaign(state, [pid])
+    sender = make_sender(state, FakeProvider())
+    sender.config.qualification = QualificationConfig(enforce=True)
+    await sender._stage_campaign_native(camp)
+    assert await state.get_outbox() == []                    # nothing staged for an unapproved company
+
+
+@pytest.mark.asyncio
+async def test_an_approved_email_to_an_unapproved_company_is_held_not_sent(state):
+    from tests.test_disqualification import approved_follow_up
+    cid = await grooming(state)
+    pid = await contact(state, cid, "info@northsidegrooming.test", status="contacted")
+    item = await approved_follow_up(state, pid, "info@northsidegrooming.test")
+    sender = make_sender(state, FakeProvider())
+    sender.config.qualification = QualificationConfig(enforce=True)
+    await sender._drain_due()
+    assert sender.provider.sent == []
+    row = await state.get_outbox_item(item)
+    assert row["status"] == "pending_review" and row["error"].startswith(qual.QUALIFICATION_PENDING)
+    assert row["subject"] == "following up" and row["body"] == "A plain note. Ok?"   # wording kept
+    # Not enforced (the default): behaviour is unchanged.
+    sender.config.qualification = QualificationConfig(enforce=False)
+
+
+# ── evidence reaches the writer, and is shown beside the draft ──
+
+class EvidenceBrain(FakeBrain):
+    def __init__(self, cited):
+        super().__init__(reply=None)
+        self.cited, self.prompts = cited, []
+
+    async def think_json(self, prompt, **kw):
+        self.prompts.append(prompt)
+        self.calls += 1
+        ids = self.cited(self.prompts[-1])
+        return {"subject": "dog grooming", "body": "Hi Jane, saw you groom dogs in Manchester.", "evidence_ids": ids}
+
+
+@pytest.mark.asyncio
+async def test_approved_evidence_is_given_to_the_writer_and_recorded(state):
+    cid = await grooming(state)
+    pid = await contact(state, cid, "info@northsidegrooming.test")
+    conf = cfg()
+    await assess_with(state, conf, cid, GOOD_SITE)
+    await state.approve_qualification(cid)
+    approved = await state.get_approved_evidence(cid)
+    first = approved[0]["id"]
+    brain = EvidenceBrain(lambda prompt: [first, "deadbeef"])    # one real id, one invented
+    w = Writer(brain, state, conf, None)
+    w.skills = ""
+    draft = await w._write_personal_email(await state.get_prospect(pid))
+    assert f"[{first}]" in brain.prompts[0] and approved[0]["url"] in brain.prompts[0]
+    ev = draft["evidence"]
+    assert [f["id"] for f in ev["cited"]] == [first]             # invented id dropped
+    assert ev["cited"][0]["quote"] and ev["cited"][0]["observed_at"]
+    assert "verify the wording" in ev["note"]                    # not presented as proof
+
+
+@pytest.mark.asyncio
+async def test_no_evidence_is_offered_for_an_unapproved_company(state):
+    cid = await grooming(state)
+    pid = await contact(state, cid, "info@northsidegrooming.test")
+    await assess_with(state, cfg(), cid, GOOD_SITE)              # assessed, not approved
+    brain = EvidenceBrain(lambda p: [])
+    w = Writer(brain, state, cfg(), None)
+    w.skills = ""
+    draft = await w._write_personal_email(await state.get_prospect(pid))
+    assert "evidence" not in (draft or {})
+
+
+@pytest.mark.asyncio
+async def test_outbox_row_keeps_the_evidence(state):
+    cid = await grooming(state)
+    pid = await contact(state, cid, "info@northsidegrooming.test")
+    item = await state.add_outbox_item(
+        prospect_id=pid, to_email="info@northsidegrooming.test", subject="s", body="b",
+        send_at="2026-10-30T10:00:00", status="pending_review", evidence_json=json.dumps({"cited": []}))
+    assert json.loads((await state.get_outbox_item(item))["evidence_json"]) == {"cited": []}
+
+
+# ── migration ──
+
+@pytest.mark.asyncio
+async def test_an_existing_v12_database_upgrades_in_place(tmp_path):
+    path = str(tmp_path / "old.db")
+    con = sqlite3.connect(path)
+    for script in MIGRATIONS[:12]:
+        con.executescript(script)
+    con.execute("PRAGMA user_version = 12")
+    con.execute("INSERT INTO companies (id, name, domain) VALUES ('c1', 'Old Co', 'old.test')")
+    con.commit(); con.close()
+
+    st = StateManager(path)
+    await st.init_db()
+    con = sqlite3.connect(path)
+    assert con.execute("PRAGMA user_version").fetchone()[0] == len(MIGRATIONS) >= 13
+    assert {"qualification_state", "qualification_decided_by"} <= {r[1] for r in con.execute("PRAGMA table_info(companies)")}
+    assert con.execute("SELECT qualification_state FROM companies").fetchone()[0] == "unassessed"
+    assert {"page_evidence", "qualification_assessments"} <= {r[0] for r in con.execute("SELECT name FROM sqlite_master")}
+    con.close()
+    assert await st.company_gate_state("c1") == "unassessed"

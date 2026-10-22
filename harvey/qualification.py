@@ -15,6 +15,7 @@ import re
 
 COMPANY_DISQUALIFIED = "company_disqualified"
 EMAIL_BLOCKED = "email_blocked"
+QUALIFICATION_PENDING = "qualification_pending"   # company not approved yet
 
 # Explicit "this business is not a fit" wording in a comment. Deliberately
 # narrow: a comment that merely mentions a business must never disqualify it.
@@ -85,3 +86,16 @@ def disqualified_text(reason: str) -> str:
     """The stored reason, always carrying the stable prefix."""
     reason = (reason or "").strip() or "marked not a fit"
     return reason if reason.startswith(COMPANY_DISQUALIFIED) else f"{COMPANY_DISQUALIFIED}: {reason}"
+
+
+def enforced(config) -> bool:
+    """True when this install requires a company to be qualified before any
+    contact search, draft or cold send (qualification.enforce)."""
+    q = getattr(config, "qualification", None)
+    return bool(getattr(q, "enforce", False))
+
+
+def pending_reason(company_state: str) -> str:
+    state = company_state or "not on file"
+    return (f"{QUALIFICATION_PENDING}: company is '{state}'; "
+            "a person has to approve it (harvey qualify approve) before outreach")
