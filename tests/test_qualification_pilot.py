@@ -429,3 +429,12 @@ def test_fact_ids_are_unique_and_consequences_are_not_repeated():
     b = assess._fact("service", "bathing", "https://pawsgroom.test/", q, "observed")
     assert a["id"] != b["id"]
     assert assess._sentence_quote("Home Services About Contact Book now. Manchester", 5, 13) == ""
+
+
+def test_service_quotes_are_whole_sentences_not_menu_fragments():
+    pg = {"http_status": 200, "final_url": "https://pawsgroom.test/", "title": "", "meta_description": "", "h1": "", "headings": [],
+          "text_excerpt": "Home About Treatments Microblading Aquarelle Lips Powder Brows Eyeliner. "
+                          "We offer microblading for natural looking brows in Manchester."}
+    out = assess._services([pg], "brow/pmu studio", {})
+    mb = [f for f in out if f["term"] == "microblading"]
+    assert mb and mb[0]["quote"].startswith("We offer microblading")

@@ -174,9 +174,17 @@ def _services(pages: list[dict], industry: str, extra_terms: dict) -> list[dict]
                     continue
                 i = low.find(term)
                 if i >= 0:
+                    if where == "page text":
+                        quote, j = "", i
+                        while j >= 0 and not quote:      # the first mention may be in a menu
+                            quote = _sentence_quote(text, j, j + len(term))
+                            j = low.find(term, j + 1)
+                    else:       # a title, description or heading is already a clean unit
+                        quote = re.sub(r"\s+", " ", text).strip()[:160]
+                    if not quote:
+                        continue        # only menu text here: try a later spot
                     seen_terms.add(term)
-                    found.append({"term": term, "where": where, "url": url,
-                                  "quote": re.sub(r"\s+", " ", text[max(0, i - 50): i + len(term) + 60]).strip()})
+                    found.append({"term": term, "where": where, "url": url, "quote": quote})
     return found[:8]
 
 
